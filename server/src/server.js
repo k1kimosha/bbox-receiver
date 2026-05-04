@@ -1,42 +1,37 @@
-const express = require("express");
-const bodyParser = require("body-parser");
-const path = require("path");
-const { readFileSync } = require("fs");
+import http from "node:http";
+import path from "node:path";
+import fs from "node:fs";
+import { fileURLToPath } from "node:url";
 
-const app = express();
-app.use(bodyParser.json());
-
-const config = JSON.parse(
-  readFileSync(path.join(__dirname, "..", "config.json"), "utf8")
-);
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const configPath = path.join(__dirname, "..", "config.json");
+const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
 
 const authConfig = new Map();
 
-config?.auth?.forEach((object) => {
-  authConfig.set(object.user, object.key);
-});
+config?.auth?.forEach((object) => authConfig.set(object.user, object.key));
 
-app.post("/sls/event", (req, res) => {
+const handleSlsEvent = (res, query) => {
   /*
-		  {
-			  on_event: 'on_connect' | 'on_close',
-			  role_name: 'publisher',
-			  srt_url: 'input/live/pack',
-			  remote_ip: '172.17.0.1',
-			  remote_port: '57374'
-		  }
-	  */
-  console.log("event", req.query);
-  const { query } = req;
+      {
+        on_event: 'on_connect' | 'on_close',
+        role_name: 'publisher',
+        srt_url: 'input/live/pack',
+        remote_ip: '172.17.0.1',
+        remote_port: '57374'
+      }
+    */
+  console.log("event", query);
   const { role_name, srt_url, remote_ip, remote_port } = query;
   const srtUrl = srt_url.split("/");
   const [, , streamName] = srtUrl;
   if (!streamName) {
-    res.status(400).send("Invalid stream name");
+    res.statusCode = 400;
+    res.end("Invalid stream name");
     return;
   }
   // get streamKey from streamName in format ?srtauth=<streamkey>
-  const [streamer, p] = streamName?.split("?");
+  const [streamer, p] = streamName.split("?");
   const params = new URLSearchParams(p);
 
   const streamKey = params.get("srtauth");
@@ -46,26 +41,29 @@ app.post("/sls/event", (req, res) => {
       const auth = authConfig.get(streamer);
       if (auth === streamKey) {
         console.log(`${role_name} connected to ${streamer}`);
-        res.sendStatus(200);
+        res.statusCode = 200;
+        res.end();
         return;
       } else {
         console.log(`${role_name} connected to ${streamer} with wrong key`);
-        res.sendStatus(401);
+        res.statusCode = 401;
+        res.end();
         return;
       }
     }
   } else if (query.on_event === "on_close") {
     console.log(`${role_name} disconnected from ${streamer}`);
-    res.sendStatus(200);
+    res.statusCode = 200;
+    res.end();
   } else {
     console.log(`${role_name} connected to ${streamer} with wrong event`);
-    res.sendStatus(401);
+    res.statusCode = 401;
+    res.end();
   }
-});
+};
 
-app.get("/stats", async (req, res) => {
+const handleStats = async (res, query) => {
   // URL: /sls/stats?streamer=<streamer>&key=<key>
-  const { query } = req;
   const { streamer, key } = query;
   const auth = authConfig.get(streamer);
   const authed = auth === key && streamer && key;
@@ -74,24 +72,38 @@ app.get("/stats", async (req, res) => {
     try {
       const publisherName = `live/stream/${streamer}?srtauth=${auth}`;
       // get data from stats page at localhost:8181/stats
-      const data = await fetch(
-        `http://localhost:8181/stats?publisher=${encodeURIComponent(
-          publisherName
-        )}`
-      );
+      const pub = encodeURIComponent(publisherName);
+      const data = await fetch(`http://localhost:8181/stats?publisher=${pub}`);
       const json = await data.json();
       if (json?.publishers) result = json?.publishers;
     } catch (e) {
       console.log(e);
     }
-    return res.status(200).json({
-      publishers: result ?? {},
-      status: "ok",
-    });
+    res.statusCode = 200;
+    res.setHeader("Content-Type", "application/json");
+    res.end(JSON.stringify({ publishers: result ?? {}, status: "ok" }));
+    return;
   }
-  return res.status(200).json({
-    status: "error",
-  });
+  res.statusCode = 200;
+  res.setHeader("Content-Type", "application/json");
+  res.end(JSON.stringify({ status: "error" }));
+  return;
+};
+
+const endpoints = {
+  GET: { "/stats": handleStats },
+  POST: { "/sls/event": handleSlsEvent },
+};
+
+const server = http.createServer((req, res) => {
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  const query = Object.fromEntries(url.searchParams.entries());
+
+  const handler = endpoints[req.method]?.[url.pathname];
+  if (handler) return handler(res, query);
+
+  res.statusCode = 404;
+  res.end("Not Found");
 });
 
-app.listen(3000, () => console.log("Server started"));
+server.listen(3000, () => console.log("Server started"));
