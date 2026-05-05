@@ -11,16 +11,16 @@ const authConfig = new Map();
 
 config?.auth?.forEach((object) => authConfig.set(object.user, object.key));
 
+/**
+ * @param {import('http').ServerResponse} res
+ * @param {Object} query
+ * @param {'on_connect' | 'on_close'} query.on_event
+ * @param {'publisher'} query.role_name
+ * @param {string} query.srt_url - Example: 'input/live/pack'
+ * @param {string} query.remote_ip - Example: '172.17.0.1'
+ * @param {string} query.remote_port - Example: '57374'
+ */
 const handleSlsEvent = (res, query) => {
-  /*
-      {
-        on_event: 'on_connect' | 'on_close',
-        role_name: 'publisher',
-        srt_url: 'input/live/pack',
-        remote_ip: '172.17.0.1',
-        remote_port: '57374'
-      }
-    */
   console.log("event", query);
   const { role_name, srt_url, remote_ip, remote_port } = query;
   const srtUrl = srt_url.split("/");
@@ -62,6 +62,12 @@ const handleSlsEvent = (res, query) => {
   }
 };
 
+/**
+ * @param {import('http').ServerResponse} res
+ * @param {Object} query
+ * @param {string} query.streamer
+ * @param {string} query.key
+ */
 const handleStats = async (res, query) => {
   // URL: /sls/stats?streamer=<streamer>&key=<key>
   const { streamer, key } = query;
