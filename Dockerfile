@@ -6,8 +6,8 @@ RUN apk update &&\
 WORKDIR /tmp
 
 # belabox patched srt
-#
-ARG BELABOX_SRT_VERSION=belabox-dev
+# Pinned commit on IRLServer/srt belabox-dev branch
+ARG BELABOX_SRT_VERSION=ae3925375593913b6dac17cf718f29511ea5d5fd
 RUN mkdir -p /build; \
     git clone https://github.com/IRLServer/srt.git /build/srt; \
     cd /build/srt; \
@@ -17,8 +17,8 @@ RUN mkdir -p /build; \
     make install;
 
 # belabox patched srtla
-#
-ARG SRTLA_VERSION=main
+# Pinned commit on IRLServer/srtla main branch
+ARG SRTLA_VERSION=2de6dbb8f99e322bb429df9b2b45f4f9425ead76
 RUN mkdir -p /build; \
     git clone https://github.com/IRLServer/srtla.git /build/srtla; \
     cd /build/srtla; \
@@ -32,8 +32,9 @@ RUN cp /build/srtla/srtla_rec /usr/local/bin/srtla_rec
 RUN cp /build/srt/srtcore/srt_compat.h /usr/local/include/srt/
 
 ENV LD_LIBRARY_PATH=/lib:/usr/lib:/usr/local/lib64
-ARG SRT_LIVE_SERVER_VERSION=main
 # use custom irl srt server from irlserver
+# Pinned commit on IRLServer/irl-srt-server main branch
+ARG SRT_LIVE_SERVER_VERSION=5ce002189ad57961198e3cb2afee56d60b87d911
 RUN set -xe; \
     mkdir -p /build; \
     git clone https://github.com/IRLServer/irl-srt-server.git /build/srt-live-server; \
