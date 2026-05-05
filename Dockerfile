@@ -65,7 +65,6 @@ RUN chmod +x /entrypoint.sh
 RUN chmod 755 /usr/local/bin/logprefix;
 
 WORKDIR /app
-RUN yarn --frozen-lockfile --production
 
 EXPOSE 5000/udp 8181/tcp 8282/udp 3000/tcp
 ENTRYPOINT ["/entrypoint.sh"]
