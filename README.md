@@ -15,7 +15,7 @@ We using the following great open-source projects:
 - srtla_rec from <https://github.com/IRLServer/srtla>
 - irl-srt-server (srt-live-server fork) from <https://github.com/IRLServer/irl-srt-server>
 
-These [IRLServer](https://irlserver.com)-supported forks have enhanced algorithms and improvements to enhance stream stability.
+These [IRLServer](https://irlserver.com)-supported forks have enhanced algorithms and improvements to enhance stream stability and security.
 
 ## Manual
 
