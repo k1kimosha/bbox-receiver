@@ -67,5 +67,5 @@ RUN chmod 755 /usr/local/bin/logprefix;
 
 WORKDIR /app
 
-EXPOSE 5000/udp 8181/tcp 8282/udp 3000/tcp
+EXPOSE 5000/udp 4000/udp 4001/udp 8181/tcp 8282/udp 3000/tcp
 ENTRYPOINT ["/entrypoint.sh"]

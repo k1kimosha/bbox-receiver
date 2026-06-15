@@ -19,12 +19,18 @@ These [IRLServer](https://irlserver.com)-supported forks have enhanced algorithm
 
 ## Manual
 
-It requires the following ports to be published:
+The server now uses separate ports for playing and publishing. Publish the ports you need:
 
-5000:5000/udp
-8181/8181/tcp
-8282/8282/udp
-3000/3000/tcp
+| Port | Proto | Purpose |
+| ---- | ----- | ------- |
+| 5000 | udp | SRTLA bonded input (Belabox connects here) |
+| 4000 | udp | Player port (pull the stream here, any publish method) |
+| 4001 | udp | Direct SRT publishers (OBS, FFmpeg, anything without SRTLA) |
+| 8181 | tcp | Statistics HTTP API |
+| 3000 | tcp | Legacy statistics and event hooks |
+| 8282 | udp | Legacy combined publish/play port (kept for backwards compatibility) |
+
+Port 4002/udp is the SRTLA publisher port. It only receives traffic from `srtla_rec` over localhost, so it does not need to be published.
 
 Create a config.json file containing:
 
@@ -45,13 +51,24 @@ Create a config.json file containing:
 
 Modify everything in bold below, then start with:
 
-docker run -d --name belabox-receiver -p 5000:5000/udp -p 8181:8181/tcp -p 8282:8282/udp -p 3000:3000/tcp -v ./config.json:/app/config.json datagutt/belabox-receiver:latest
+docker run -d --name belabox-receiver -p 5000:5000/udp -p 4000:4000/udp -p 4001:4001/udp -p 8181:8181/tcp -p 3000:3000/tcp -v ./config.json:/app/config.json datagutt/belabox-receiver:latest
 
-Configure SRT receiver and SRT port within belabox to point to the docker container's IP address (or a port-forward on your router).
+### Publishing (Belabox / SRTLA)
+
+Configure the SRT receiver and SRT port within Belabox to point to the docker container's IP address (or a port-forward on your router), using port 5000.
 Within Belabox, set "live/stream/belabox?srtauth=belabox" as SRT streamid.
 
-To retrieve the SRT-Stream (via OBS, VLC etc.), open the following URL:
-srt://your-public-container-ip:8282/?streamid=play/stream/belabox?srtauth=belabox
+### Publishing (direct SRT, no SRTLA)
+
+For a direct SRT publisher (OBS, FFmpeg) without bonding, publish to port 4001:
+srt://your-public-container-ip:4001?streamid=live/stream/belabox?srtauth=belabox
+
+### Playing
+
+To retrieve the SRT stream (via OBS, VLC etc.), regardless of how it was published, open the following URL on the player port 4000:
+srt://your-public-container-ip:4000?streamid=play/stream/belabox?srtauth=belabox
+
+The legacy port 8282 still serves both publishing and playing for older setups.
 
 Statistics-URL: <http://your-public-container-ip:8181/stats?publisher=live%2Fstream%2Fbelabox%3Fsrtauth%3Dbelabox>
 
