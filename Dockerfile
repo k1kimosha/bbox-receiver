@@ -1,4 +1,4 @@
-FROM alpine:3.23 AS builder
+FROM alpine:3.24 AS builder
 RUN apk update &&\
     apk upgrade &&\ 
     apk add --no-cache linux-headers alpine-sdk cmake tcl openssl-dev zlib-dev spdlog spdlog-dev cmake
@@ -7,7 +7,7 @@ WORKDIR /tmp
 
 # belabox patched srt
 # Pinned commit on IRLServer/srt belabox-dev branch
-ARG BELABOX_SRT_VERSION=ae3925375593913b6dac17cf718f29511ea5d5fd
+ARG BELABOX_SRT_VERSION=b5690bcf9bcd7d4dee87273e6233d729ee5114dc
 RUN mkdir -p /build; \
     git clone https://github.com/IRLServer/srt.git /build/srt; \
     cd /build/srt; \
@@ -34,7 +34,7 @@ RUN cp /build/srt/srtcore/srt_compat.h /usr/local/include/srt/
 ENV LD_LIBRARY_PATH=/lib:/usr/lib:/usr/local/lib64
 # use custom irl srt server from irlserver
 # Pinned commit on IRLServer/irl-srt-server main branch
-ARG SRT_LIVE_SERVER_VERSION=78d67c0af61c442d0bb7160a487b363950dfa2ee
+ARG SRT_LIVE_SERVER_VERSION=d45b948a71650ad683020db5fecb9fa31542f306
 RUN set -xe; \
     mkdir -p /build; \
     git clone https://github.com/IRLServer/irl-srt-server.git /build/srt-live-server; \
@@ -48,7 +48,7 @@ RUN set -xe; \
 
 # runtime container with server
 #
-FROM node:alpine3.23
+FROM node:alpine3.24
 ENV LD_LIBRARY_PATH=/lib:/usr/lib:/usr/local/lib64
 RUN apk add --update --no-cache openssl libstdc++ supervisor perl coreutils spdlog spdlog-dev
 
