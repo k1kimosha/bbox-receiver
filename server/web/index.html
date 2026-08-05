@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Belabox Receiver — Управление</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+
+<div id="login-view" class="center hidden">
+  <form id="login-form" class="card">
+    <h1>Belabox Receiver</h1>
+    <p class="muted">Вход в панель управления</p>
+    <label>Логин
+      <input type="text" id="login-user" autocomplete="username" required>
+    </label>
+    <label>Пароль
+      <input type="password" id="login-pass" autocomplete="current-password" required>
+    </label>
+    <div id="login-error" class="error hidden"></div>
+    <button type="submit" class="primary">Войти</button>
+  </form>
+</div>
+
+<div id="app-view" class="hidden">
+  <header>
+    <h1>Belabox Receiver</h1>
+    <div class="header-right">
+      <span id="user-label" class="muted"></span>
+      <button id="logout-btn" class="ghost">Выйти</button>
+    </div>
+  </header>
+
+  <main>
+    <section>
+      <h2>Трансляции <span class="muted small">(обновление каждые 2 секунды)</span></h2>
+      <div id="stats-status" class="muted"></div>
+      <div id="stats-cards" class="cards"></div>
+    </section>
+
+    <section>
+      <h2>Профили</h2>
+      <div class="toolbar">
+        <button id="add-profile-btn" class="primary">+ Добавить профиль</button>
+      </div>
+      <table class="table" id="profiles-table">
+        <thead>
+          <tr>
+            <th>Пользователь</th>
+            <th>Ключ</th>
+            <th>Статус</th>
+            <th>Ссылки</th>
+            <th>Действия</th>
+          </tr>
+        </thead>
+        <tbody id="profiles-body"></tbody>
+      </table>
+      <div id="profiles-empty" class="muted hidden">Профилей пока нет</div>
+    </section>
+  </main>
+</div>
+
+<div id="modal-backdrop" class="modal-backdrop hidden">
+  <div id="modal" class="modal"></div>
+</div>
+
+<div id="toast" class="toast hidden"></div>
+
+<script src="/app.js"></script>
+</body>
+</html>

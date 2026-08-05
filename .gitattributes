@@ -1,0 +1,6 @@
+* text=auto
+
+*.sh text eol=lf
+entrypoint.sh text eol=lf
+files/logprefix text eol=lf
+files/*.conf text eol=lf
