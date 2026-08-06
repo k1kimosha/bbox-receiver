@@ -1,0 +1,1388 @@
+
+/**
+ * The MIT License (MIT)
+ *
+ * Copyright (c) 2019-2020 Edward.Wu
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy of
+ * this software and associated documentation files (the "Software"), to deal in
+ * the Software without restriction, including without limitation the rights to
+ * use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+ * the Software, and to permit persons to whom the Software is furnished to do so,
+ * subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+ * FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+ * COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+ * IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+ * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+ */
+
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/time.h>
+#include <sys/types.h>
+
+#include <netinet/in.h>
+#include <arpa/inet.h>
+
+#include <cstdarg>
+#include <errno.h>
+#include <fcntl.h>
+#include <grp.h>
+#include <netdb.h>
+#include <pwd.h>
+#include <signal.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+#include "spdlog/spdlog.h"
+
+#include <algorithm>
+#include <filesystem>
+#include <string>
+#include <vector>
+
+#include "common.hpp"
+#include "SLSManager.hpp"
+#include "util.hpp"
+
+#define HAVE_GETTIMEOFDAY 1
+
+int64_t sls_gettime_ms(void) // rturn millisecond
+{
+    return sls_gettime() / 1000;
+}
+
+int64_t sls_gettime(void) // rturn micro-second
+{
+#if HAVE_GETTIMEOFDAY
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (int64_t)tv.tv_sec * 1000000 + tv.tv_usec;
+#elif HAVE_GETSYSTEMTIMEASFILETIME
+    FILETIME ft;
+    int64_t t;
+    GetSystemTimeAsFileTime(&ft);
+    t = (int64_t)ft.dwHighDateTime << 32 | ft.dwLowDateTime;
+    return t / 10 - 11644473600000000; /* Jan 1, 1601 */
+#else
+    return -1;
+#endif
+}
+
+void sls_gettime_default_string(char *cur_time_buf, size_t cur_time_buf_len)
+{
+    if (NULL == cur_time_buf)
+    {
+        return;
+    }
+    int64_t cur_time_sec = sls_gettime() / 1000000;
+    sls_gettime_fmt(cur_time_buf, cur_time_buf_len, cur_time_sec, "%Y-%m-%d %H:%M:%S");
+}
+
+void sls_gettime_fmt(char *dst, size_t dst_len, int64_t cur_time_sec, const char *fmt)
+{
+    time_t rawtime;
+    struct tm *timeinfo;
+    char timef[32] = {0};
+
+    time(&rawtime);
+    rawtime = (time_t)cur_time_sec;
+    timeinfo = localtime(&rawtime);
+    strftime(timef, sizeof(timef), fmt, timeinfo);
+    strlcpy(dst, timef, dst_len);
+    return;
+}
+
+char *sls_strupper(char *str)
+{
+    char *orign = str;
+    for (; *str != '\0'; str++)
+        *str = toupper(*str);
+    return orign;
+}
+
+char *sls_strlower(char *str)
+{
+    char *orign = str;
+    for (; *str != '\0'; str++)
+        *str = tolower(*str);
+    return orign;
+}
+
+#define sls_hash(key, c) ((uint32_t)key * 31 + c)
+uint32_t sls_hash_key(const char *data, size_t len)
+{
+    // copy form ngx
+    uint32_t i, key;
+
+    key = 0;
+
+    for (i = 0; i < len; i++)
+    {
+        key = sls_hash(key, data[i]);
+    }
+    return key;
+}
+
+int sls_gethostbyname(const char *hostname, char *ip)
+{
+    char *ptr;
+    // char **pptr;
+    struct hostent *hptr;
+    // Must hold an IPv6 literal (up to 45 chars + NUL): a 32-byte buffer made
+    // inet_ntop fail (NULL) for long IPv6 addresses, which then crashed the
+    // strcpy below. ip must be >= INET6_ADDRSTRLEN; all callers pass IP_MAX_LEN.
+    char str[INET6_ADDRSTRLEN];
+    ptr = (char *)hostname;
+    int ret = SLS_ERROR;
+
+    if ((hptr = gethostbyname(ptr)) == NULL)
+    {
+        spdlog::warn("sls_gethostbyname: gethostbyname error for host: {0}", ptr);
+        return ret;
+    }
+
+    /*
+    printf("official hostname:%s\n",hptr->h_name);
+     for(pptr = hptr->h_aliases; *pptr != NULL; pptr++)
+         printf(" alias:%s\n",*pptr);
+    */
+
+    switch (hptr->h_addrtype)
+    {
+    case AF_INET:
+    case AF_INET6:
+    {
+        // copy the 1st ip. inet_ntop returns NULL on failure (e.g. buffer too
+        // small) — copying that with strcpy crashed, so guard it and bound the
+        // copy to the destination contract (>= INET6_ADDRSTRLEN).
+        const char *res = inet_ntop(hptr->h_addrtype, hptr->h_addr, str, sizeof(str));
+        if (res == NULL)
+        {
+            spdlog::warn("sls_gethostbyname: inet_ntop failed for host: {0}", ptr);
+            break;
+        }
+        strlcpy(ip, res, INET6_ADDRSTRLEN);
+        ret = SLS_OK;
+        break;
+    }
+    default:
+        spdlog::warn("sls_gethostbyname: unknown address type");
+        break;
+    }
+
+    return ret;
+}
+
+int sls_derive_rcv_buf_mb()
+{
+    const sls_conf_srt_t *root = (const sls_conf_srt_t *)sls_conf_get_root_conf();
+    // Explicit override always wins.
+    if (root && root->rcv_buf_mb > 0)
+        return root->rcv_buf_mb;
+
+    int max_kbps = (root && root->rcv_sizing_max_bitrate_kbps > 0) ? root->rcv_sizing_max_bitrate_kbps : 20000;
+    int max_lat_ms = (root && root->rcv_sizing_max_latency_ms > 0) ? root->rcv_sizing_max_latency_ms : 8000;
+
+    // required bytes = (kbps * 1000 / 8) bytes/s * (ms / 1000) s * 2.5 headroom
+    //               = kbps * 125 * ms * 25 / 10000   (integer, no precision loss)
+    // The 2.5x headroom covers the SRT retransmission window on top of the raw
+    // latency buffer. Mirrors how the application ring is sized from bitrate x
+    // latency, applied here to the SRT transport buffer.
+    int64_t bytes = (int64_t)max_kbps * 125 * max_lat_ms * 25 / 10000;
+    int mb = (int)((bytes + (1 << 20) - 1) >> 20); // ceil to whole MB
+    if (mb < 8)
+        mb = 8; // floor: keep low-latency streams from under-buffering
+    if (mb > 100)
+        mb = 100; // ceiling: bound pre-auth memory (global cap + rate limit bound the rest)
+    return mb;
+}
+
+int sls_mkdir_p(const char *path)
+{
+    if (!path || !*path)
+        return -1;
+
+    std::error_code ec;
+    std::filesystem::create_directories(path, ec);
+    if (ec)
+        return -1;
+
+    // Preserve the historical 0755 mode the predecessor mkdir(2) call set
+    // explicitly. create_directories honours the process umask, which is
+    // typically 022 (yielding 0755), but downstream HLS recording flows may
+    // run under a tighter umask; pin the mode here so behaviour is stable.
+    std::filesystem::permissions(path,
+                                 std::filesystem::perms::owner_all | std::filesystem::perms::group_read |
+                                     std::filesystem::perms::group_exec | std::filesystem::perms::others_read |
+                                     std::filesystem::perms::others_exec,
+                                 std::filesystem::perm_options::replace, ec);
+    if (ec)
+        return -1;
+
+    return 0;
+}
+
+void sls_remove_marks(char *s)
+{
+    int len = strlen(s);
+    if (len < 2) // pair
+        return;
+
+    if ((s[0] == '\'' && s[len - 1] == '\'') || (s[0] == '"' && s[len - 1] == '"'))
+    {
+        for (int i = 0; i < len - 2; i++)
+        {
+            s[i] = s[i + 1];
+        }
+        s[len - 2] = 0x0;
+    }
+}
+
+// Streamid components flow into filesystem paths (HLS recording dir,
+// on_event_url) and map keys. Without sanitisation a crafted streamid like
+// "domain/app/../../../tmp/evil" gives an unauthenticated client a write
+// primitive via mkdir_p. Reject empty, path separators, control chars,
+// and bare "." / ".." here so everything downstream is safe by construction.
+bool sls_is_safe_name(const char *s)
+{
+    if (!s || !*s)
+        return false;
+    if (s[0] == '.' && (s[1] == 0 || (s[1] == '.' && s[2] == 0)))
+        return false;
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++)
+    {
+        if (*p == '/' || *p == '\\')
+            return false;
+        // URL-significant characters that have no place in a streamid
+        // component. When the pull relay is enabled the stream name is
+        // concatenated into an outbound srt:// URL; allowing these would
+        // let a player splice query parameters into the relay leg. ':' and
+        // '@' are left alone — they have legitimate uses in URL authority
+        // and could appear in opaque identifiers the operator already
+        // accepts; the injection vector is the query/fragment, not the
+        // authority.
+        if (*p == '#' || *p == '&' || *p == '%' || *p == ' ')
+            return false;
+        if (*p < 0x20 || *p == 0x7f)
+            return false;
+    }
+    return true;
+}
+
+int sls_read_pid()
+{
+    struct stat stat_file;
+    int ret = stat(pid_file_name, &stat_file);
+    if (0 != ret)
+    {
+        spdlog::warn("no pid file='{0}'.", pid_file_name);
+        return 0;
+    }
+
+    int fd = open(pid_file_name, O_RDONLY);
+    if (fd < 0)
+    {
+        spdlog::error("open file='{0}' failed.", pid_file_name);
+        return 0;
+    }
+    char pid[128] = {0};
+    if (read(fd, pid, sizeof(pid)) < 0)
+    {
+        spdlog::error("Invalid PID file content");
+        ret = -1;
+    }
+    else
+    {
+        ret = atoi(pid);
+    }
+    close(fd);
+    return ret;
+}
+
+bool sls_is_pid_location_changed()
+{
+    sls_conf_srt_t *conf_srt = (sls_conf_srt_t *)sls_conf_get_root_conf();
+    if (strcmp(conf_srt->pidfile, pid_file_name) == 0)
+    {
+        return false;
+    }
+    else
+    {
+        return true;
+    }
+}
+
+int sls_reload_pid()
+{
+    if (sls_is_pid_location_changed())
+    {
+        spdlog::debug("Reloading PID file location");
+        if (sls_remove_pid() != SLS_OK)
+        {
+            spdlog::error("Could not remove PID file");
+            return SLS_ERROR;
+        }
+        if (sls_write_pid(getpid()) != SLS_OK)
+        {
+            spdlog::error("Could not write new PID file");
+            return SLS_ERROR;
+        }
+    }
+    return SLS_OK;
+}
+
+int sls_load_pid_filename()
+{
+    // Load configuration from SLSManager
+    sls_conf_srt_t *conf_srt = (sls_conf_srt_t *)sls_conf_get_root_conf();
+    if (!sls_is_pid_location_changed())
+    {
+        spdlog::debug("PID file not changed, using default value [{}]", pid_file_name);
+        return SLS_ERROR;
+    }
+    else if (strlen(conf_srt->pidfile) > 0)
+    {
+        spdlog::debug("PID file specified in configuration [{}]", conf_srt->pidfile);
+        strlcpy(pid_file_name, conf_srt->pidfile, sizeof(pid_file_name));
+        return SLS_OK;
+    }
+    else
+    {
+        spdlog::debug("PID file not specified, using default [{}]", pid_file_name);
+        return SLS_ERROR;
+    }
+}
+
+int sls_write_pid(int pid)
+{
+    if (std::filesystem::is_regular_file(pid_file_name))
+    {
+        spdlog::error("PID file already exists.");
+        spdlog::error("If no copy of SRT Live Server is running, delete it and try again.");
+        spdlog::error("If you are trying to run multiple instances of SRT Live Server,");
+        spdlog::error("use a separate configuration file specifying a different PID file.");
+        return SLS_ERROR;
+    }
+
+    string pidfile_dir_string = std::filesystem::path(pid_file_name).parent_path().u8string();
+    char pidfile_dir[pidfile_dir_string.length() + 1];
+    strlcpy(pidfile_dir, pidfile_dir_string.c_str(), sizeof(pidfile_dir));
+
+    if (strcmp(pidfile_dir, pid_file_name) == 0)
+    {
+        spdlog::error("Could not write PID file: directory provided, expected file");
+        return SLS_ERROR;
+    }
+
+    std::error_code ec;
+    std::filesystem::create_directories(pidfile_dir_string, ec);
+
+    if (ec.value() != 0)
+    {
+        spdlog::error("Could not create PID directory [errno={:d} msg='{}']", ec.value(), ec.message());
+        return SLS_ERROR;
+    }
+
+    // O_EXCL closes the check-then-open race against the is_regular_file probe
+    // above and refuses to follow a symlink pre-planted at this path (the PID
+    // dir lives in shared /tmp). Mode 0644 drops the group-write bit so a peer
+    // process cannot rewrite our PID. fd 0 is a valid descriptor, so test fd<0.
+    int fd = open(pid_file_name, O_WRONLY | O_CREAT | O_EXCL, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+    if (fd < 0)
+    {
+        spdlog::error("open file='{0}' failed, '{1}'.", pid_file_name, strerror(errno));
+        return SLS_ERROR;
+    }
+    char buf[128] = {0};
+    snprintf(buf, sizeof(buf), "%d", pid);
+    write(fd, buf, strlen(buf));
+    close(fd);
+    spdlog::info("write pid ok, file='{0}', pid={1}.", pid_file_name, buf);
+    return 0;
+}
+
+int sls_remove_pid()
+{
+    int pid_from_file = sls_read_pid();
+    if (pid_from_file == 0)
+    {
+        // Check if PIDfile exists
+        spdlog::warn("Could not remove non-existent PID file");
+        return SLS_ERROR;
+    }
+    else if (pid_from_file != getpid())
+    {
+        // Check if we own the PID file
+        spdlog::error("PID file not owned by current process [my_pid={:d} file_pid={:d}]", getpid(), pid_from_file);
+        return SLS_ERROR;
+    }
+    else
+    {
+
+        // Try to remove PID file
+        std::error_code ec;
+        if (!std::filesystem::remove(pid_file_name, ec))
+        {
+            spdlog::warn("Could not remove PID file [errno={:d} msg='{}']", ec.value(), ec.message());
+            return SLS_ERROR;
+        }
+        else
+        {
+            spdlog::info("Removed PID file");
+            return SLS_OK;
+        }
+    }
+}
+
+int sls_send_cmd(const char *cmd)
+{
+    if (NULL == cmd)
+    {
+        spdlog::error("sls_send_cmd failed, cmd is null.");
+        return SLS_ERROR;
+    }
+    int pid = sls_read_pid();
+    if (0 >= pid)
+    {
+        spdlog::error("sls_send_cmd failed, pid is invalid [pid={0:d}].", pid);
+        return SLS_OK;
+    }
+
+    // reload?
+    if (strcmp(cmd, "reload") == 0)
+    {
+        // reload the existed sls
+        spdlog::info("sls_send_cmd ok, reload, sls pid = {0:d}, send SIGUP to it.", pid);
+        kill(pid, SIGHUP);
+        return SLS_OK;
+    }
+
+    // ctrl + c
+    if (strcmp(cmd, "stop") == 0)
+    {
+        //
+        spdlog::info("sls_send_cmd ok, stop, sls pid = {0:d}, send SIGINT to it.", pid);
+        kill(pid, SIGINT);
+        return SLS_OK;
+    }
+    return SLS_OK;
+}
+
+int sls_drop_privileges(const char *user, const char *group)
+{
+    bool want_user = (user != NULL && user[0] != '\0');
+    bool want_group = (group != NULL && group[0] != '\0');
+
+    if (!want_user && !want_group)
+        return SLS_OK;
+
+    if (want_group && !want_user)
+    {
+        spdlog::critical("sls_drop_privileges: 'group' set without 'user'. Configure both or neither.");
+        return SLS_ERROR;
+    }
+
+    if (geteuid() != 0)
+    {
+        spdlog::warn("sls_drop_privileges: not running as root, ignoring user='{}' group='{}'.", user ? user : "",
+                     group ? group : "");
+        return SLS_OK;
+    }
+
+    errno = 0;
+    struct passwd *pw = getpwnam(user);
+    if (!pw)
+    {
+        spdlog::critical("sls_drop_privileges: user '{}' not found (errno={}).", user, errno);
+        return SLS_ERROR;
+    }
+    uid_t target_uid = pw->pw_uid;
+    gid_t target_gid = pw->pw_gid;
+
+    if (want_group)
+    {
+        errno = 0;
+        struct group *gr = getgrnam(group);
+        if (!gr)
+        {
+            spdlog::critical("sls_drop_privileges: group '{}' not found (errno={}).", group, errno);
+            return SLS_ERROR;
+        }
+        target_gid = gr->gr_gid;
+    }
+
+    if (initgroups(user, target_gid) != 0)
+    {
+        spdlog::critical("sls_drop_privileges: initgroups('{}', {}) failed: {}.", user, (int)target_gid,
+                         strerror(errno));
+        return SLS_ERROR;
+    }
+
+    if (setgid(target_gid) != 0)
+    {
+        spdlog::critical("sls_drop_privileges: setgid({}) failed: {}.", (int)target_gid, strerror(errno));
+        return SLS_ERROR;
+    }
+
+    if (setuid(target_uid) != 0)
+    {
+        spdlog::critical("sls_drop_privileges: setuid({}) failed: {}.", (int)target_uid, strerror(errno));
+        return SLS_ERROR;
+    }
+
+    // Paranoia: confirm the drop is irreversible.
+    if (target_uid != 0 && setuid(0) == 0)
+    {
+        spdlog::critical("sls_drop_privileges: privilege drop did not stick; setuid(0) succeeded.");
+        return SLS_ERROR;
+    }
+
+    spdlog::info("sls_drop_privileges: dropped to uid={} gid={} (user='{}', group='{}').", (int)target_uid,
+                 (int)target_gid, user, want_group ? group : "(from passwd)");
+    return SLS_OK;
+}
+
+#define ADD_VECTOR_END(v, i) (v).push_back((i))
+
+// Clients occasionally paste a streamid with a stray newline or surrounding
+// whitespace (copy/paste from chat, config files with trailing \n). Those
+// bytes would otherwise fail sls_is_safe_name (control chars) or silently
+// produce a distinct map key / on_event_url, so trim once at the parse
+// boundary and everything downstream sees the clean value.
+std::string sls_trim(const std::string &str)
+{
+    const char *ws = " \t\r\n\f\v";
+    string::size_type first = str.find_first_not_of(ws);
+    if (first == string::npos)
+        return "";
+    string::size_type last = str.find_last_not_of(ws);
+    return str.substr(first, last - first + 1);
+}
+
+void sls_split_string(std::string str, std::string separator, std::vector<std::string> &result, int count)
+{
+    result.clear();
+    string::size_type position = str.find(separator);
+    string::size_type lastPosition = 0;
+    uint32_t separatorLength = (uint32_t)separator.length();
+
+    int i = 0;
+    while (position != str.npos)
+    {
+        ADD_VECTOR_END(result, str.substr(lastPosition, position - lastPosition));
+        lastPosition = position + separatorLength;
+        position = str.find(separator, lastPosition);
+        i++;
+        if (i == count)
+            break;
+    }
+    ADD_VECTOR_END(result, str.substr(lastPosition, string::npos));
+}
+
+std::string sls_find_string(std::vector<std::string> &src, std::string &dst, bool caseSensitive)
+{
+    if (!caseSensitive)
+        std::transform(dst.begin(), dst.end(), dst.begin(), ::tolower);
+
+    std::string ret = std::string("");
+    std::vector<std::string>::iterator it;
+    for (it = src.begin(); it != src.end();)
+    {
+        std::string str = *it;
+        if (!caseSensitive)
+            std::transform(str.begin(), str.end(), str.begin(), ::tolower);
+        it++;
+
+        string::size_type pos = str.find(dst);
+        if (pos != std::string::npos)
+        {
+            ret = str;
+            break;
+        }
+    }
+    return ret;
+}
+
+/**
+ * parse ts
+ */
+enum
+{
+    H264_NAL_UNSPECIFIED = 0,
+    H264_NAL_SLICE = 1,
+    H264_NAL_DPA = 2,
+    H264_NAL_DPB = 3,
+    H264_NAL_DPC = 4,
+    H264_NAL_IDR_SLICE = 5,
+    H264_NAL_SEI = 6,
+    H264_NAL_SPS = 7,
+    H264_NAL_PPS = 8,
+    H264_NAL_AUD = 9,
+};
+
+static int64_t ff_parse_pes_pts(const uint8_t *buf, int len)
+{
+    // Length-driven: the 5-byte PTS/DTS field must fit in the buffer.
+    if (len < 5)
+        return INVALID_DTS_PTS;
+
+    int64_t pts = 0;
+    int64_t tmp = (int64_t)((buf[0] & 0x0e) << 29);
+    pts = pts | tmp;
+    tmp = (int64_t)((((int64_t)(buf[1] & 0xFF) << 8) | (buf[2]) >> 1) << 15);
+    pts = pts | tmp;
+    tmp = (int64_t)((((int64_t)(buf[3] & 0xFF) << 8) | (buf[4])) >> 1);
+    pts = pts | tmp;
+    return pts;
+}
+
+static int sls_parse_spspps(const uint8_t *es, int es_len, ts_info *ti)
+{
+    int ret = SLS_ERROR;
+    int pos = 0;
+    uint8_t *p = NULL;
+    uint8_t *p_end = NULL;
+    uint8_t nal_type = 0;
+    // pos + 4 < es_len keeps es[pos+3]/es[pos+4] in bounds without the signed
+    // underflow the (pos < es_len - 4) form has when es_len is small.
+    while (pos + 4 < es_len)
+    {
+        // avc nal
+        // bool b_nal = false;
+        if (0x0 == es[pos] && 0x0 == es[pos + 1] && 0x0 == es[pos + 2] &&
+            (0x1 == es[pos + 3] || (0x0 == es[pos + 3] && 0x1 == es[pos + 4])))
+        {
+            if (p != NULL)
+            {
+                p_end = (uint8_t *)es + pos;
+                if (H264_NAL_SPS == nal_type)
+                {
+                    int n = (int)(p_end - p);
+                    if (n < 0 || n > (int)sizeof(ti->sps))
+                    {
+                        spdlog::warn("parse_spspps: SPS len {} exceeds buffer {}, dropping.", n, (int)sizeof(ti->sps));
+                    }
+                    else
+                    {
+                        ti->sps_len = n;
+                        memcpy(ti->sps, p, n);
+                    }
+                }
+                else if (H264_NAL_PPS == nal_type)
+                {
+                    int n = (int)(p_end - p);
+                    if (n < 0 || n > (int)sizeof(ti->pps))
+                    {
+                        spdlog::warn("parse_spspps: PPS len {} exceeds buffer {}, dropping.", n, (int)sizeof(ti->pps));
+                    }
+                    else
+                    {
+                        ti->pps_len = n;
+                        memcpy(ti->pps, p, n);
+                    }
+                }
+                else
+                {
+                    spdlog::error("parse_spspps, wrong nal type={0:d}.", nal_type);
+                }
+
+                if (ti->sps_len > 0 && ti->pps_len > 0)
+                {
+                    p = NULL;
+                    ret = SLS_OK;
+                    break;
+                }
+            }
+            int nal_pos = pos + (es[pos + 3] ? 4 : 5);
+            if (nal_pos >= es_len)
+                break;
+            nal_type = es[nal_pos] & 0x1f;
+            if (H264_NAL_SPS == nal_type || H264_NAL_PPS == nal_type)
+            {
+                p = (uint8_t *)es + pos;
+            }
+            pos = nal_pos;
+        }
+        else
+        {
+            pos++;
+        }
+    }
+
+    // last nal
+    if (p != NULL)
+    {
+
+        p_end = (uint8_t *)es + es_len;
+        if (H264_NAL_SPS == nal_type)
+        {
+            int n = (int)(p_end - p);
+            if (n < 0 || n > (int)sizeof(ti->sps))
+            {
+                spdlog::warn("parse_spspps: SPS len {} exceeds buffer {}, dropping.", n, (int)sizeof(ti->sps));
+            }
+            else
+            {
+                ti->sps_len = n;
+                memcpy(ti->sps, p, n);
+            }
+        }
+        else if (H264_NAL_PPS == nal_type)
+        {
+            int n = (int)(p_end - p);
+            if (n < 0 || n > (int)sizeof(ti->pps))
+            {
+                spdlog::warn("parse_spspps: PPS len {} exceeds buffer {}, dropping.", n, (int)sizeof(ti->pps));
+            }
+            else
+            {
+                ti->pps_len = n;
+                memcpy(ti->pps, p, n);
+            }
+        }
+        else
+        {
+            spdlog::error("parse_spspps, wrong nal type={0:d}.", nal_type);
+        }
+        if (ti->sps_len > 0 && ti->pps_len > 0)
+        {
+            ret = SLS_OK;
+        }
+    }
+    return ret;
+}
+
+static int sls_parse_sei_read_bit_at(const uint8_t *buf, int len, int *bit_pos)
+{
+    if (*bit_pos >= len * 8)
+        return -1;
+    int byte = (*bit_pos) >> 3;
+    int bit = 7 - ((*bit_pos) & 7);
+    (*bit_pos)++;
+    return (buf[byte] >> bit) & 1;
+}
+
+static int sls_parse_sei_read_bits(const uint8_t *buf, int len, int *bit_pos, int n)
+{
+    if (n <= 0 || n > 32)
+        return -1;
+    uint32_t value = 0;
+    for (int i = 0; i < n; i++)
+    {
+        int b = sls_parse_sei_read_bit_at(buf, len, bit_pos);
+        if (b < 0)
+            return -1;
+        value = (value << 1) | b;
+    }
+    return (int)value;
+}
+
+static int sls_parse_sei_read_ue(const uint8_t *buf, int len, int *bit_pos)
+{
+    int zero_count = 0;
+    int b = 0;
+    while (zero_count < 32)
+    {
+        b = sls_parse_sei_read_bit_at(buf, len, bit_pos);
+        if (b < 0)
+            return -1;
+        if (b == 1)
+            break;
+        zero_count++;
+    }
+    if (zero_count == 32)
+        return -1;
+    if (zero_count == 0)
+        return 0;
+    uint64_t code_num = 0;
+    for (int i = 0; i < zero_count; i++)
+    {
+        b = sls_parse_sei_read_bit_at(buf, len, bit_pos);
+        if (b < 0)
+            return -1;
+        code_num = (code_num << 1) | b;
+    }
+    return (int)((1ULL << zero_count) - 1 + code_num);
+}
+
+/**
+ * Parse H.264 SEI timecode messages (payloadType 136) from an ES payload.
+ * Scans NAL units delimited by start codes; the SEI NAL (type 6) carries
+ * messages as (payloadType, payloadSize) Exp-Golomb pairs followed by the
+ * payload. Only the SMPTE timecode SEI (payloadType == 136) is of interest.
+ * See H.264 AVC Appendix D.2.25 "Time code" SEI payload semantics
+ * (SMPTE ST 12-1 layout, as produced by ffmpeg's mpegts muxer):
+ *   count_type(5) | full_timestamp_flag(1) | dont_convert_flag(1) |
+ *   [if full] hours(5) | minutes(6) | seconds(6) | frames(6)
+ */
+void sls_parse_sei_timecode(const uint8_t *es, int es_len, ts_info *ti)
+{
+    if (!es || !ti || es_len < 4)
+        return;
+    int pos = 0;
+    // Scan for NAL start codes (00 00 01 or 00 00 00 01), like sls_parse_spspps.
+    while (pos + 4 < es_len)
+    {
+        if (0x00 == es[pos] && 0x00 == es[pos + 1] && 0x00 == es[pos + 2] &&
+            (0x01 == es[pos + 3] || (0x00 == es[pos + 3] && 0x01 == es[pos + 4])))
+        {
+            int nal_pos = pos + (es[pos + 3] ? 4 : 5);
+            if (nal_pos >= es_len)
+                break;
+            int nal_type = es[nal_pos] & 0x1f;
+            if (H264_NAL_SEI == nal_type)
+            {
+                // SEI payload starts right after the NAL header byte.
+                int bit_pos = (nal_pos + 1) * 8;
+                while (bit_pos + 8 <= es_len * 8)
+                    {
+                        int payload_type = sls_parse_sei_read_ue(es, es_len, &bit_pos);
+                        if (payload_type < 0)
+                            break;
+                        int payload_size = sls_parse_sei_read_ue(es, es_len, &bit_pos);
+                        if (payload_size < 0)
+                            break;
+                        if (payload_type == 136 && payload_size >= 4)
+                        {
+                            // Bitstream layout (H.264 D.2.25, SMPTE ST 12-1):
+                            //   count_type(5) | full_timestamp_flag(1) |
+                            //   dont_convert_flag(1) |
+                            //   [if full] hours(5) | minutes(6) | seconds(6) |
+                            //   frames(6)
+                            int count_type = sls_parse_sei_read_bits(es, es_len, &bit_pos, 5);
+                            if (count_type < 0)
+                                break;
+                            int full_ts = sls_parse_sei_read_bits(es, es_len, &bit_pos, 1);
+                            if (full_ts < 0)
+                                break;
+                            int dont_convert = sls_parse_sei_read_bits(es, es_len, &bit_pos, 1);
+                            if (dont_convert < 0)
+                                break;
+                            if (full_ts)
+                            {
+                                int hours = sls_parse_sei_read_bits(es, es_len, &bit_pos, 5);
+                                int minutes = sls_parse_sei_read_bits(es, es_len, &bit_pos, 6);
+                                int seconds = sls_parse_sei_read_bits(es, es_len, &bit_pos, 6);
+                                int frames = sls_parse_sei_read_bits(es, es_len, &bit_pos, 6);
+                                if (hours < 0 || minutes < 0 || seconds < 0 || frames < 0)
+                                    break;
+                                ti->sei_valid = true;
+                                ti->sei_hours = hours;
+                                ti->sei_minutes = minutes;
+                                ti->sei_seconds = seconds;
+                                ti->sei_frames = frames;
+                                ti->sei_last_pts = ti->pts;
+                                ti->sei_update_count.fetch_add(1, std::memory_order_relaxed);
+                                return;
+                            }
+                        }
+                        // Advance to the start of the next SEI message body.
+                        // bit_pos currently sits right after the payload_type/size
+                        // headers; jump over the payload bytes.
+                        int payload_start = (bit_pos + 7) / 8;
+                        if (payload_start + payload_size > es_len)
+                            break;
+                        bit_pos = (payload_start + payload_size) * 8;
+                        if (payload_size == 0)
+                            break;
+                    }
+            }
+            pos = nal_pos + 1;
+        }
+        else
+        {
+            pos++;
+        }
+    }
+}
+
+static int sls_pes2es(const uint8_t *pes_frame, int pes_len, ts_info *ti, int pid)
+{
+    if (!pes_frame)
+    {
+        spdlog::error("pes2es: pes_frame is null.");
+        return SLS_ERROR;
+    }
+    uint8_t *pes = (uint8_t *)pes_frame;
+    uint8_t *pes_end = (uint8_t *)pes_frame + pes_len;
+
+    // Length-driven: each advance below is guarded against pes_end so a
+    // truncated PES payload can never drive a read past the packet buffer.
+    if (pes_len < 3 || pes[0] != 0x00 || pes[1] != 0x00 || pes[2] != 0x01)
+    {
+        return SLS_ERROR;
+    }
+    pes += 3;
+
+    /* it must be an MPEG-2 PES stream */
+    if (pes >= pes_end)
+        return SLS_ERROR;
+    int stream_id = (pes[0] & 0xFF);
+    if (stream_id != 0xE0 && stream_id != 0xC0)
+    {
+        spdlog::error("pes2es: pid={0:d}, wrong pes stream_id={1:#x}.", pid, stream_id);
+        return SLS_ERROR;
+    }
+    pes++;
+
+    if (pes + 2 > pes_end)
+        return SLS_ERROR;
+    int total_size = ((int)(pes[0] << 8)) | pes[1];
+    pes += 2;
+    /* NOTE: a zero total size means the PES size is
+     * unbounded */
+    if (0 == total_size)
+        total_size = MAX_PES_PAYLOAD;
+
+    // two PES header flag bytes + PES_header_data_length
+    if (pes + 3 > pes_end)
+        return SLS_ERROR;
+    int flags = 0;
+    /*
+    '10'                        :2,
+    PES_scrambling_control      :2,
+    PES_priority                :1,
+    data_alignment_indicator    :1,
+    copyright                   :1,
+    original_or_copy            :1
+     */
+    flags = (pes[0] & 0x7F);
+    pes++;
+
+    /*
+    PTS_DTS_flags               :2,
+    ESCR_flag                   :1,
+    ES_rate_flag:1,
+    DSM_trick_mode_flag:1,
+    additional_copy_info_flag:1,
+    PES_CRC_flag:1,
+    PES_extension_flag:1,
+     */
+    flags = (pes[0] & 0xFF);
+    pes++;
+
+    int header_len = (pes[0] & 0xFF);
+    pes++;
+    ti->dts = INVALID_DTS_PTS;
+    ti->pts = INVALID_DTS_PTS;
+    if ((flags & 0xc0) == 0x80)
+    {
+        if (pes + 5 > pes_end)
+            return SLS_ERROR;
+        ti->dts = ti->pts = ff_parse_pes_pts(pes, (int)(pes_end - pes));
+        pes += 5;
+    }
+    else if ((flags & 0xc0) == 0xc0)
+    {
+        if (pes + 10 > pes_end)
+            return SLS_ERROR;
+        ti->pts = ff_parse_pes_pts(pes, (int)(pes_end - pes));
+        pes += 5;
+        ti->dts = ff_parse_pes_pts(pes, (int)(pes_end - pes));
+        pes += 5;
+    }
+
+    int ret = SLS_OK;
+    // parse timecode SEI from video PES payloads
+    if (stream_id == 0xE0 && pes < pes_end)
+    {
+        sls_parse_sei_timecode(pes, (int)(pes_end - pes), ti);
+    }
+    // parse sps and pps
+    if (ti->need_spspps && pes < pes_end)
+    {
+        ret = sls_parse_spspps(pes, (int)(pes_end - pes), ti);
+        if (ti->sps_len > 0 && ti->pps_len > 0 && ti->pat_len > 0 && ti->pmt_len > 0)
+        {
+            uint8_t *p = ti->ts_data;
+            int pos = 0;
+            uint8_t tmp;
+
+            // pat, pmt
+            memcpy(p + pos, ti->pat, TS_PACK_LEN);
+            pos += TS_PACK_LEN;
+            memcpy(p + pos, ti->pmt, TS_PACK_LEN);
+            pos += TS_PACK_LEN;
+
+            // sps pps
+            int len = ti->sps_len + ti->pps_len;
+            len = len + 9 + 5; // pes len
+            if (len > TS_PACK_LEN - 4)
+            {
+                spdlog::error("pid={0:d}, pes size={1:d} is abnormal!!!!\n", pid, len);
+                return ret;
+            }
+            pos++;
+            // pid
+            ti->es_pid = pid;
+            tmp = ti->es_pid >> 8;
+            p[pos++] = 0x40 | tmp;
+            tmp = ti->es_pid;
+            p[pos++] = tmp;
+            p[pos] = 0x10;
+            int ad_len = TS_PACK_LEN - 4 - len - 1;
+            if (ad_len > 0)
+            {
+                p[pos++] = 0x30;
+                p[pos++] = ad_len; // adaptation length
+                p[pos++] = 0x00;   //
+                memset(p + pos, 0xFF, ad_len - 1);
+                pos += ad_len - 1;
+            }
+            else
+            {
+                pos++;
+            }
+
+            // pes
+            p[pos++] = 0;
+            p[pos++] = 0;
+            p[pos++] = 1;
+            p[pos++] = stream_id;
+            p[pos++] = 0;    // total size
+            p[pos++] = 0;    // total size
+            p[pos++] = 0x80; // flag
+            p[pos++] = 0x80; // flag
+            p[pos++] = 5;    // header_len
+            p[pos++] = 0;    // pts
+            p[pos++] = 0;
+            p[pos++] = 0;
+            p[pos++] = 0;
+            p[pos++] = 0;
+            memcpy(p + pos, ti->sps, ti->sps_len);
+            pos += ti->sps_len;
+            memcpy(p + pos, ti->pps, ti->pps_len);
+            pos += ti->pps_len;
+        }
+    }
+    return ret;
+}
+
+static int sls_parse_pat(const uint8_t *pat_data, int len, ts_info *ti)
+{
+    // Need the 8-byte section header; this also guarantees the buffer[len-4..]
+    // CRC read below stays in bounds (len >= 8 > 4).
+    if (len < 8)
+        return SLS_ERROR;
+
+    uint8_t *buffer = (uint8_t *)pat_data;
+    int table_id = buffer[0];
+    int section_syntax_indicator = buffer[1] >> 7;
+    int zero = buffer[1] >> 6 & 0x1;
+    int reserved_1 = buffer[1] >> 4 & 0x3;
+    int section_length = (buffer[1] & 0x0F) << 8 | buffer[2];
+    int transport_stream_id = buffer[3] << 8 | buffer[4];
+    int reserved_2 = buffer[5] >> 6;
+    int version_number = buffer[5] >> 1 & 0x1F;
+    int current_next_indicator = (buffer[5] << 7) >> 7;
+    int section_number = buffer[6];
+    int last_section_number = buffer[7];
+
+    int CRC_32 = (buffer[len - 4] & 0x000000FF) << 24 | (buffer[len - 3] & 0x000000FF) << 16 |
+                 (buffer[len - 2] & 0x000000FF) << 8 | (buffer[len - 1] & 0x000000FF);
+
+    // Each program entry is the 4 bytes buffer[8+n .. 11+n]. Clamp the loop to
+    // the smaller of the declared section length and the actual buffer so a
+    // crafted section_length (e.g. 0xFFF) can never read past len.
+    int prog_end = section_length - 12;
+    if (prog_end > len - 11)
+        prog_end = len - 11; // last read buffer[11+n] needs 11+n <= len-1
+    int n = 0;
+    for (n = 0; n < prog_end; n += 4)
+    {
+        unsigned program_num = buffer[8 + n] << 8 | buffer[9 + n];
+        int reserved_3 = buffer[10 + n] >> 5;
+        int network_PID = 0x00;
+        if (program_num == 0x00)
+        {
+            network_PID = (buffer[10 + n] & 0x1F) << 8 | buffer[11 + n];
+        }
+        else
+        {
+            ti->pmt_pid = (buffer[10 + n] & 0x1F) << 8 | buffer[11 + n];
+        }
+    }
+    return SLS_OK;
+}
+
+int sls_parse_pmt_for_audio(const uint8_t *pmt_data, int len, ts_info *ti)
+{
+    if (len < 12)
+        return SLS_ERROR;
+
+    uint8_t *buffer = (uint8_t *)pmt_data;
+    int section_length = (buffer[1] & 0x0F) << 8 | buffer[2];
+    int program_info_length = (buffer[10] & 0x0F) << 8 | buffer[11];
+
+    int pos = 12 + program_info_length;
+    int end = 3 + section_length - 4; // exclude CRC
+
+    ti->audio_track_count = 0;
+    uint8_t next_stream_id = 0xC0; // audio stream IDs are 0xC0-0xDF
+
+    while (pos + 5 <= end && pos + 5 <= len)
+    {
+        int stream_type = buffer[pos];
+        int elementary_pid = ((buffer[pos + 1] & 0x1F) << 8) | buffer[pos + 2];
+        int es_info_length = ((buffer[pos + 3] & 0x0F) << 8) | buffer[pos + 4];
+
+        // Remember the video PID (H.264 = 0x1B, HEVC = 0x24) for SEI parsing.
+        if (stream_type == 0x1B || stream_type == 0x24)
+        {
+            ti->video_pid = elementary_pid;
+            ti->video_pid_found = true;
+        }
+
+        bool is_audio = false;
+
+        // Known audio stream types:
+        // 0x03 = MPEG-1 Audio (MP3)
+        // 0x04 = MPEG-2 Audio (MP3)
+        // 0x0F = AAC (ADTS)
+        // 0x11 = AAC (LATM/LOAS)
+        // 0x81 = AC-3 (Dolby Digital) - common in ATSC
+        // 0x06 = Private data (may contain Opus, AC-3, or other codecs via descriptors)
+        if (stream_type == 0x0F || stream_type == 0x11 || stream_type == 0x03 || stream_type == 0x04 ||
+            stream_type == 0x81)
+        {
+            is_audio = true;
+        }
+        else if (stream_type == 0x06 && es_info_length > 0)
+        {
+            // Check ES descriptors for audio codec identifiers
+            int desc_pos = pos + 5;
+            int desc_end = desc_pos + es_info_length;
+            while (desc_pos + 2 <= desc_end && desc_pos + 2 <= len)
+            {
+                int desc_tag = buffer[desc_pos];
+                int desc_len = buffer[desc_pos + 1];
+                // 0x05 = Registration descriptor (check for 'Opus')
+                // 0x7F = Extension descriptor (check for Opus sub-descriptor 0x80)
+                if (desc_tag == 0x05 && desc_len >= 4 && desc_pos + 6 <= len)
+                {
+                    if (buffer[desc_pos + 2] == 'O' && buffer[desc_pos + 3] == 'p' && buffer[desc_pos + 4] == 'u' &&
+                        buffer[desc_pos + 5] == 's')
+                    {
+                        is_audio = true;
+                    }
+                }
+                desc_pos += 2 + desc_len;
+            }
+        }
+
+        if (is_audio && ti->audio_track_count < MAX_AUDIO_TRACKS)
+        {
+            audio_track_info *at = &ti->audio_tracks[ti->audio_track_count];
+            sls_init_audio_track(at);
+            at->pid = elementary_pid;
+            at->stream_type = stream_type;
+            at->stream_id = next_stream_id++;
+            ti->audio_track_count++;
+
+            spdlog::debug("sls_parse_pmt_for_audio: found audio track {} - PID={}, stream_type={:#x}",
+                          ti->audio_track_count, elementary_pid, stream_type);
+        }
+
+        pos += 5 + es_info_length;
+    }
+
+    if (ti->audio_track_count > 0)
+    {
+        ti->pmt_parsed = true;
+        spdlog::info("sls_parse_pmt_for_audio: found {} audio track(s)", ti->audio_track_count);
+        return SLS_OK;
+    }
+    return SLS_ERROR;
+}
+
+int sls_parse_ts_info(const uint8_t *packet, int len, ts_info *ti)
+{
+    // Every read below indexes within a single 188-byte TS packet, so require a
+    // full packet up front; partial tails are rejected rather than parsed OOB.
+    if (NULL == packet || len < TS_PACK_LEN)
+        return SLS_ERROR;
+
+    if (packet[0] != TS_SYNC_BYTE)
+    {
+        spdlog::error("ts2es: packet[0]={0:#x} not 0x47.\n", packet[0]);
+        return SLS_ERROR;
+    }
+
+    int is_start = packet[1] & 0x40;
+    if (0 == is_start)
+    {
+        // no start indicatore
+        return SLS_ERROR;
+    }
+
+    int pid = (int)((packet[1] & 0x1F) << 8) | (packet[2] & 0xFF);
+    if (PAT_PID == pid)
+    {
+        // save pat table
+        memcpy(ti->pat, packet, TS_PACK_LEN);
+        ti->pat_len = TS_PACK_LEN;
+    }
+    else
+    {
+        if (ti->pmt_pid == pid)
+        {
+            memcpy(ti->pmt, packet, TS_PACK_LEN);
+            ti->pmt_len = TS_PACK_LEN;
+            // Parse PMT to find audio PID if not yet done
+            if (!ti->pmt_parsed)
+            {
+                int pmt_payload_offset = 4;
+                int afc_pmt = (packet[3] >> 4) & 3;
+                if (afc_pmt & 2)
+                    pmt_payload_offset += 1 + (packet[4] & 0xFF);
+                if (packet[1] & 0x40)     // payload unit start
+                    pmt_payload_offset++; // skip pointer field
+                if (pmt_payload_offset < TS_PACK_LEN)
+                    sls_parse_pmt_for_audio(packet + pmt_payload_offset, TS_PACK_LEN - pmt_payload_offset, ti);
+            }
+            return SLS_OK;
+        }
+        if (INVALID_PID != ti->es_pid)
+        {
+            if (pid != ti->es_pid)
+            {
+                // not available pid
+                return SLS_ERROR;
+            }
+        }
+    }
+
+    // start to parse the dts
+    int afc = (packet[3] >> 4) & 3;
+    if (afc == 0) /* reserved value */
+        return SLS_ERROR;
+    int has_adaptation = afc & 2;
+    int has_payload = afc & 1;
+    bool is_discontinuity = (has_adaptation == 1) && (packet[4] != 0) && /* with length > 0 */
+                            ((packet[5] & 0x80) != 0);                   /* and discontinuity indicated */
+
+    if ((packet[1] & 0x80) != 0)
+    {
+        // Log.i(TAG, "SrsTSToES, Packet had TEI flag set; marking as corrupt ");
+    }
+
+    int pos = 4;
+    int p = (packet[pos] & 0xFF);
+    if (has_adaptation != 0)
+    {
+        int64_t pcr_h;
+        int pcr_l;
+        // if (parse_pcr(&pcr_h, &pcr_l, packet) == 0)
+        // ts->last_pcr = pcr_h * 300 + pcr_l;
+        /* skip adaptation field */
+        pos += p + 1;
+        // printf("ts2es: adaptation, pos=%d.", pos);
+    }
+    /* if past the end of packet, ignore */
+    if (pos >= TS_PACK_LEN || 1 != has_payload)
+    {
+        spdlog::error("ts2es: pid={0:d}, payload len={1:d}, >188.\n", pid, pos);
+        return SLS_ERROR;
+    }
+
+    if (pid == PAT_PID)
+    {
+        if (is_start)
+            pos++;
+        return sls_parse_pat(packet + pos, TS_PACK_LEN - pos, ti);
+    }
+
+    int ret = sls_pes2es(packet + pos, TS_PACK_LEN - pos, ti, pid);
+    if (ti->dts != INVALID_DTS_PTS)
+    {
+        ti->es_pid = pid;
+    }
+    if (ti->sps_len > 0 && ti->pps_len > 0)
+    {
+        ti->es_pid = pid;
+    }
+    return ret;
+}
+
+void sls_init_audio_track(audio_track_info *at)
+{
+    if (at)
+    {
+        at->pid = INVALID_PID;
+        at->stream_type = 0;
+        at->stream_id = 0xC0;
+        at->last_pts = INVALID_DTS_PTS;
+        at->cc = 0;
+        at->expected_cc = 0;
+        at->cc_initialized = false;
+        at->in_gap = true; // drop orphaned continuations until first PES start
+        at->sample_rate = 0;
+        at->channels = 0;
+        at->sample_rate_index = 0;
+        at->channel_config = 0;
+        at->profile = 0;
+        at->bitrate_index = 0;
+        at->format_detected = false;
+        at->gap_count = 0;
+        at->silent_frames_inserted = 0;
+        at->silent_packets_inserted = 0;
+        at->silent_bytes_inserted = 0;
+        at->last_gap_pts_delta = 0;
+        at->last_gap_frames = 0;
+        at->partial_pes_dropped = 0;
+    }
+}
+
+void sls_init_ts_info(ts_info *ti)
+{
+    if (NULL != ti)
+    {
+        ti->es_pid = INVALID_PID;
+        ti->dts = INVALID_DTS_PTS;
+        ti->pts = INVALID_DTS_PTS;
+        ti->sps_len = 0;
+        ti->pps_len = 0;
+        ti->pat_len = 0;
+        ti->pmt_len = 0;
+        ti->pmt_pid = INVALID_PID;
+        ti->need_spspps = false;
+        ti->audio_gap_fill_enabled = false;
+        ti->pmt_parsed = false;
+        ti->audio_track_count = 0;
+        ti->video_pid = INVALID_PID;
+        ti->video_pid_found = false;
+        ti->sei_valid = false;
+        ti->sei_hours = 0;
+        ti->sei_minutes = 0;
+        ti->sei_seconds = 0;
+        ti->sei_frames = 0;
+        ti->sei_last_pts = INVALID_DTS_PTS;
+        ti->sei_update_count = 0;
+        ti->gap_count = 0;
+        ti->silent_frames_inserted = 0;
+        ti->silent_packets_inserted = 0;
+        ti->silent_bytes_inserted = 0;
+        for (int t = 0; t < MAX_AUDIO_TRACKS; t++)
+            sls_init_audio_track(&ti->audio_tracks[t]);
+
+        memset(ti->ts_data, 0, TS_UDP_LEN);
+
+        for (int i = 0; i < TS_UDP_LEN;)
+        {
+            ti->ts_data[i] = 0x47;
+            ti->ts_data[i + 1] = 0x1F;
+            ti->ts_data[i + 2] = 0xFF;
+            ti->ts_data[i + 3] = 0x00;
+            i += TS_PACK_LEN;
+        }
+    }
+}

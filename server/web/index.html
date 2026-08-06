@@ -27,27 +27,30 @@
   <header>
     <h1>Belabox Receiver</h1>
     <div class="header-right">
+      <span id="role-label" class="badge hidden"></span>
       <span id="user-label" class="muted"></span>
+      <button id="users-btn" class="ghost hidden">Пользователи</button>
       <button id="logout-btn" class="ghost">Выйти</button>
     </div>
   </header>
 
   <main>
-    <section>
+    <section id="stats-section">
       <h2>Трансляции <span class="muted small">(обновление каждые 2 секунды)</span></h2>
       <div id="stats-status" class="muted"></div>
       <div id="stats-cards" class="cards"></div>
     </section>
 
     <section>
-      <h2>Профили</h2>
+      <h2>Профили <span id="profile-limit" class="muted small hidden"></span></h2>
       <div class="toolbar">
         <button id="add-profile-btn" class="primary">+ Добавить профиль</button>
       </div>
       <table class="table" id="profiles-table">
         <thead>
           <tr>
-            <th>Пользователь</th>
+            <th>Источник</th>
+            <th>Владелец</th>
             <th>Ключ</th>
             <th>Статус</th>
             <th>Ссылки</th>
@@ -62,7 +65,7 @@
 </div>
 
 <div id="modal-backdrop" class="modal-backdrop hidden">
-  <div id="modal" class="modal"></div>
+  <div id="modal" class="modal modal-wide"></div>
 </div>
 
 <div id="toast" class="toast hidden"></div>

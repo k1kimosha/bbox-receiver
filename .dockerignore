@@ -1,0 +1,6 @@
+.git
+server/data
+server/config.json
+config.json
+.env
+.gitattributes

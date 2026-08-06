@@ -1,0 +1,164 @@
+
+/**
+ * The MIT License (MIT)
+ *
+ * Copyright (c) 2019-2020 Edward.Wu
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy of
+ * this software and associated documentation files (the "Software"), to deal in
+ * the Software without restriction, including without limitation the rights to
+ * use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of
+ * the Software, and to permit persons to whom the Software is furnished to do so,
+ * subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+ * FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+ * COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+ * IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+ * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+ */
+
+#pragma once
+
+#include <srt/srt.h>
+#include <netinet/in.h>
+
+enum SRTMode
+{
+    SRT_MODE_CALLER = 0,
+    SRT_MODE_LISTENER = 1,
+    SRT_MODE_RENDEZVOUS = 2
+};
+
+typedef struct SRTContext
+{
+    SRTSOCKET fd;
+    int eid;
+    int flag;
+    int port;
+    char hostname[1024];
+    int reuse;
+    int backlog;
+
+    int64_t rw_timeout;
+    int64_t listen_timeout;
+    int recv_buffer_size;
+    int send_buffer_size;
+
+    int64_t maxbw;
+    int pbkeylen;
+    char *passphrase;
+    int mss;
+    int ffs;
+    int ipttl;
+    int iptos;
+    int64_t inputbw;
+    int oheadbw;
+    int32_t latency;
+    int peer_idle_timeout; // SRTO_PEERIDLETIMEO (ms) for accepted sockets; 0 = leave libsrt/fork default
+    int tlpktdrop;
+    int nakreport;
+    int64_t connect_timeout;
+    int payload_size;
+    int32_t rcvlatency;
+    int32_t peerlatency;
+    enum SRTMode mode;
+    int sndbuf;
+    int rcvbuf;
+    int lossmaxttl;
+    int minversion;
+    char *streamid;
+    char *smoother;
+    int messageapi;
+    SRT_TRANSTYPE transtype;
+    double mbpsBandwidth;
+    double msRTT;
+} SRTContext;
+
+/**
+ * CSLSSrt ,functions of srt
+ */
+class CSLSSrt
+{
+public:
+    CSLSSrt();
+    ~CSLSSrt();
+
+    static int libsrt_init();
+    static int libsrt_uninit();
+    static int libsrt_epoll_create();
+    static void libsrt_epoll_release(int eid);
+
+    void libsrt_set_context(SRTContext *sc);
+
+    int libsrt_setup(int port, bool srtla_patches = false);
+    int libsrt_close();
+
+    int libsrt_listen(int backlog);
+    int libsrt_set_listen_callback(srt_listen_callback_fn *listen_callback_fn, void *opaque = nullptr);
+    int libsrt_accept();
+
+    int libsrt_get_fd();
+    int libsrt_set_fd(int fd);
+
+    int libsrt_set_eid(int eid);
+
+    int libsrt_read(char *buf, int size);
+    int libsrt_write(const char *buf, int size);
+
+    int libsrt_socket_nonblock(int enable);
+
+    int libsrt_getsockopt(SRT_SOCKOPT optname, const char *optnamestr, void *optval, int *optlen);
+    int libsrt_setsockopt(SRT_SOCKOPT optname, const char *optnamestr, const void *optval, int optlen);
+
+    std::map<std::string, std::string> libsrt_parse_sid(char *sid);
+
+    int libsrt_add_to_epoll(int eid, bool write);
+    // Arm/disarm SRT_EPOLL_OUT on an already-registered socket. Writable
+    // roles are registered ERR-only (see libsrt_add_to_epoll); OUT is
+    // armed dynamically only while a write is backpressured so the worker
+    // wakes when the send buffer drains, instead of busy-returning on a
+    // permanently-writable idle socket.
+    int libsrt_arm_epoll_out(bool enable);
+    int libsrt_remove_from_epoll();
+
+    int libsrt_getsockstate();
+    int libsrt_getpeeraddr(char *peer_name, int &port);
+    int libsrt_getpeeraddr_raw(unsigned long &address, struct in6_addr &address6);
+    // True once libsrt_getpeeraddr_raw has resolved an IPv6 peer. ACL code
+    // uses this to know that peer_addr_raw is not meaningful for matching.
+    bool libsrt_is_ipv6_peer() const
+    {
+        return m_is_ipv6;
+    }
+    int libsrt_get_statistics(SRT_TRACEBSTATS *currentStats, int clear);
+
+    void libsrt_set_latency(int latency);
+    void libsrt_set_peer_idle_timeout(int timeout_ms);
+    void libsrt_set_passphrase(const char *passphrase, int pbkeylen);
+
+    static int libsrt_neterrno();
+    // Non-logging variant: returns the SRT error code from srt_getlasterror()
+    // without emitting a log line. Use this on the hot path (per-write
+    // backpressure check) where libsrt_neterrno's spdlog::error call would
+    // flood the log under load.
+    static int libsrt_lasterror();
+    static void libsrt_print_error_info();
+
+protected:
+    SRTContext m_sc;
+    char m_passphrase[80];
+    int m_pbkeylen;
+    char m_peer_name[256]; // peer ip addr, such as 172.12.22.14
+    int m_peer_port;
+    unsigned long m_peer_addr_raw;    //  Peer IP addr in unsigned long format
+    struct in6_addr m_peer_addr6_raw; // IPv6 address
+    bool m_is_ipv6;                   // Flag to indicate if the address is IPv6
+
+private:
+    static bool m_inited;
+};

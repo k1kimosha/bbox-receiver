@@ -1,0 +1,15 @@
+[submodule "lib/spdlog"]
+	path = lib/spdlog
+	url = https://github.com/irlserver/spdlog
+[submodule "lib/json"]
+	path = lib/json
+	url = https://github.com/nlohmann/json
+[submodule "lib/thread-pool"]
+	path = lib/thread-pool
+	url = https://github.com/bshoshany/thread-pool.git
+[submodule "lib/cpp-httplib"]
+	path = lib/cpp-httplib
+	url = https://github.com/yhirose/cpp-httplib.git
+[submodule "lib/CxxUrl"]
+	path = lib/CxxUrl
+	url = https://github.com/chmike/CxxUrl.git

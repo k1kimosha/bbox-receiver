@@ -13,7 +13,7 @@ RUN mkdir -p /build; \
     cd /build/srt; \
     git checkout $BELABOX_SRT_VERSION; \
     ./configure; \
-    make -j${nproc}; \
+    make -j4; \
     make install;
 
 # belabox patched srtla
@@ -25,7 +25,7 @@ RUN mkdir -p /build; \
     git checkout $SRTLA_VERSION; \
     git submodule init && git submodule update --recursive; \
     cmake .; \
-    make -j${nproc};
+    make -j4;
 
 RUN cp /build/srtla/srtla_rec /usr/local/bin/srtla_rec
 # I honestly don't know why this is needed after rebasing with mainstream SRT
@@ -40,9 +40,21 @@ RUN set -xe; \
     git clone https://github.com/IRLServer/irl-srt-server.git /build/srt-live-server; \
     cd /build/srt-live-server; \
     git checkout $SRT_LIVE_SERVER_VERSION; \
+    git submodule update --init;
+
+# Apply SEI timecode patch over the pinned upstream source
+COPY sls-patch/src/core/common.hpp /build/srt-live-server/src/core/common.hpp
+COPY sls-patch/src/core/common.cpp /build/srt-live-server/src/core/common.cpp
+COPY sls-patch/src/core/SLSMapData.hpp /build/srt-live-server/src/core/SLSMapData.hpp
+COPY sls-patch/src/core/SLSMapData.cpp /build/srt-live-server/src/core/SLSMapData.cpp
+COPY sls-patch/src/core/SLSManager.cpp /build/srt-live-server/src/core/SLSManager.cpp
+COPY sls-patch/src/core/SLSRole.hpp /build/srt-live-server/src/core/SLSRole.hpp
+COPY sls-patch/src/core/SLSRole.cpp /build/srt-live-server/src/core/SLSRole.cpp
+RUN set -xe; \
+    cd /build/srt-live-server; \
     git submodule update --init; \
     cmake . -DCMAKE_BUILD_TYPE=Release; \
-    make -j${nproc}; \
+    make -j4; \
     cp bin/* /usr/local/bin;
 
 

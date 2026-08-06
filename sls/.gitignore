@@ -1,0 +1,21 @@
+logs/
+build/
+bin/
+build-srt/
+build-wsl/
+external/
+# CMake artifacts
+CMakeFiles/
+CMakeCache.txt
+**/*.o
+**/*.a
+**/*.so
+**/*.dylib
+**/*.dll
+**/*.exe
+**/*.pdb
+fuzzing/
+.vscode/
+/.claude
+/build-linux
+/build-*

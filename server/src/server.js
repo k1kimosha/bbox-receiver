@@ -3,6 +3,14 @@ import path from "node:path";
 import fs from "node:fs";
 import crypto from "node:crypto";
 import { fileURLToPath } from "node:url";
+import {
+  db,
+  sql,
+  hashPassword,
+  verifyPassword,
+  userCan,
+  visibleProfiles,
+} from "./db.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const configPath = path.join(__dirname, "..", "config.json");
@@ -43,48 +51,57 @@ if (!ADMIN_PASS || ADMIN_PASS === "change_me") {
   console.warn("[web] WARNING: WEB_PASS not set or default - set it in .env!");
 }
 
-// ---- Profiles (config.json) -------------------------------------------------
+// ---- Bootstrap: admin user + migrate config.json ----------------------------
 
-let authConfig = new Map();
+function bootstrap() {
+  const userCount = sql.listUsers.all().length;
+  if (userCount === 0) {
+    const passHash = hashPassword(ADMIN_PASS);
+    sql.createUser.run(ADMIN_USER, passHash, "admin", 1, -1);
+    sql.setRoot.run(ADMIN_USER);
+    console.log(`[db] created admin user '${ADMIN_USER}'`);
+  }
 
-function loadConfig() {
-  try {
-    const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
-    authConfig = new Map((config?.auth || []).map((o) => [o.user, o.key]));
-    console.log(`[web] loaded ${authConfig.size} profile(s) from config.json`);
-  } catch (e) {
-    console.error(`[web] failed to read ${configPath}: ${e.message}`);
-    authConfig = new Map();
+  if (sql.countRoots.get().c === 0) {
+    const first = sql.firstRootCandidate.get();
+    if (first) {
+      sql.setRoot.run(first.username);
+      console.log(`[db] marked '${first.username}' as root admin`);
+    }
+  }
+
+  const profileCount = sql.listProfiles.all().length;
+  if (profileCount === 0 && fs.existsSync(configPath)) {
+    try {
+      const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
+      const list = config?.auth || [];
+      for (const p of list) {
+        if (p?.user && p?.key) {
+          sql.createProfile.run(p.user, p.key, ADMIN_USER);
+        }
+      }
+      console.log(`[db] migrated ${list.length} profile(s) from config.json`);
+    } catch (e) {
+      console.error(`[web] failed to migrate config.json: ${e.message}`);
+    }
   }
 }
-loadConfig();
+bootstrap();
 
-function saveConfig(authList) {
-  const data = JSON.stringify({ auth: authList }, null, 2);
-  try {
-    const tmpPath = `${configPath}.tmp`;
-    fs.writeFileSync(tmpPath, data);
-    fs.renameSync(tmpPath, configPath);
-  } catch (e) {
-    console.warn(`[web] atomic rename failed (${e.code}), writing directly`);
-    fs.writeFileSync(configPath, data);
-  }
-  authConfig = new Map(authList.map((o) => [o.user, o.key]));
+// ---- Profiles (authConfig mirror of DB) -------------------------------------
+
+function reloadAuthConfig() {
+  return new Map(sql.listProfiles.all().map((p) => [p.user, p.key]));
 }
 
-function safeSave(res, authList) {
-  try {
-    saveConfig(authList);
-    return true;
-  } catch (e) {
-    console.error(`[web] failed to save config: ${e.message}`);
-    sendJson(res, 500, { status: "error", message: "Не удалось сохранить конфигурацию" });
-    return false;
-  }
+let authConfig = reloadAuthConfig();
+
+function getProfile(user) {
+  return sql.getProfile.get(user);
 }
 
 function getProfiles() {
-  return [...authConfig.entries()].map(([user, key]) => ({ user, key }));
+  return sql.listProfiles.all();
 }
 
 function generateKey() {
@@ -121,9 +138,9 @@ function parseCookies(cookieHeader) {
   return result;
 }
 
-function createSession(user) {
+function createSession(username) {
   const token = crypto.randomBytes(32).toString("hex");
-  sessions.set(token, { user, expiresAt: Date.now() + SESSION_TTL_MS });
+  sessions.set(token, { username, expiresAt: Date.now() + SESSION_TTL_MS });
   return token;
 }
 
@@ -137,6 +154,12 @@ function getSession(req) {
     return null;
   }
   return session;
+}
+
+function getSessionUser(req) {
+  const session = getSession(req);
+  if (!session) return null;
+  return sql.getUserByUsername.get(session.username);
 }
 
 function deleteSession(req) {
@@ -182,6 +205,25 @@ function buildUrls(user, key, host) {
 function resolveHost(req) {
   if (PUBLIC_HOST) return PUBLIC_HOST;
   return req.headers.host?.replace(/:\d+$/, "") || "localhost";
+}
+
+function requireAuth(req, res) {
+  const user = getSessionUser(req);
+  if (!user) {
+    sendJson(res, 401, { status: "error", message: "Требуется авторизация" });
+    return null;
+  }
+  return user;
+}
+
+function requireAdmin(req, res) {
+  const user = requireAuth(req, res);
+  if (!user) return null;
+  if (user.role !== "admin") {
+    sendJson(res, 403, { status: "error", message: "Недостаточно прав" });
+    return null;
+  }
+  return user;
 }
 
 // ---- SLS event webhook (unchanged behaviour) --------------------------------
@@ -257,12 +299,13 @@ const handleLogin = async (req, res) => {
     return sendJson(res, 400, { status: "error", message: "Invalid JSON" });
   }
   const { user, pass } = body;
-  if (user === ADMIN_USER && pass === ADMIN_PASS) {
-    const token = createSession(user);
+  const row = sql.getUserByUsername.get(user);
+  if (row && verifyPassword(pass, row.pass_hash)) {
+    const token = createSession(row.username);
     res.statusCode = 200;
     res.setHeader("Set-Cookie", `sid=${token}; HttpOnly; SameSite=Lax; Path=/; Max-Age=86400`);
     res.setHeader("Content-Type", "application/json; charset=utf-8");
-    res.end(JSON.stringify({ status: "ok" }));
+    res.end(JSON.stringify({ status: "ok", role: row.role }));
     return;
   }
   sendJson(res, 401, { status: "error", message: "Неверный логин или пароль" });
@@ -276,30 +319,81 @@ const handleLogout = (req, res) => {
 };
 
 const handleSession = (req, res) => {
-  const session = getSession(req);
-  if (!session) return sendJson(res, 401, { status: "error" });
-  sendJson(res, 200, { status: "ok", user: session.user });
+  const user = getSessionUser(req);
+  if (!user) return sendJson(res, 401, { status: "error" });
+  const created = sql.countUserProfiles.get(user.username).c;
+  sendJson(res, 200, {
+    status: "ok",
+    user: user.username,
+    role: user.role,
+    canViewStats: !!user.can_view_stats,
+    maxProfiles: user.max_profiles,
+    createdProfiles: created,
+  });
 };
 
 const handleListProfiles = (req, res) => {
+  const user = getSessionUser(req);
+  if (!user) return sendJson(res, 401, { status: "error", message: "Требуется авторизация" });
   const host = resolveHost(req);
-  const profiles = getProfiles().map((p) => ({ ...p, urls: buildUrls(p.user, p.key, host) }));
-  sendJson(res, 200, { status: "ok", profiles, host });
+  const rows = visibleProfiles(user);
+  const profiles = rows.map((p) => {
+    const rights = userCan(user, p);
+    const out = {
+      user: p.user,
+      createdBy: p.created_by,
+      canViewKey: rights.viewKey,
+      canManage: rights.manage,
+    };
+    if (rights.viewKey) {
+      out.key = p.key;
+      out.urls = buildUrls(p.user, p.key, host);
+    } else {
+      out.key = null;
+      out.urls = null;
+    }
+    return out;
+  });
+  const created = sql.countUserProfiles.get(user.username).c;
+  sendJson(res, 200, {
+    status: "ok",
+    profiles,
+    host,
+    me: {
+      user: user.username,
+      role: user.role,
+      canViewStats: !!user.can_view_stats,
+      maxProfiles: user.max_profiles,
+      createdProfiles: created,
+    },
+  });
 };
 
 const handleCreateProfile = async (req, res) => {
+  const user = getSessionUser(req);
+  if (!user) return sendJson(res, 401, { status: "error", message: "Требуется авторизация" });
   let body = {};
   try {
     body = JSON.parse((await readBody(req)) || "{}");
   } catch {
     return sendJson(res, 400, { status: "error", message: "Invalid JSON" });
   }
-  const user = body.user;
-  if (!validateUser(user)) {
+  const name = body.user;
+  if (!validateUser(name)) {
     return sendJson(res, 400, { status: "error", message: "Недопустимое имя пользователя" });
   }
-  if (authConfig.has(user)) {
+  if (sql.getProfile.get(name)) {
     return sendJson(res, 409, { status: "error", message: "Профиль уже существует" });
+  }
+  if (user.role !== "admin") {
+    const max = Number(user.max_profiles);
+    const count = sql.countUserProfiles.get(user.username).c;
+    if (max >= 0 && count >= max) {
+      return sendJson(res, 403, {
+        status: "error",
+        message: `Достигнут лимит профилей (${max}). Обратитесь к администратору`,
+      });
+    }
   }
   let key = body.key ?? "";
   if (key !== "") {
@@ -312,16 +406,28 @@ const handleCreateProfile = async (req, res) => {
   } else {
     key = generateKey();
   }
-  if (!safeSave(res, [{ user, key }, ...getProfiles()])) return;
-  sendJson(res, 201, { status: "ok", profile: { user, key } });
+  try {
+    sql.createProfile.run(name, key, user.username);
+  } catch (e) {
+    return sendJson(res, 409, { status: "error", message: "Профиль уже существует" });
+  }
+  authConfig.set(name, key);
+  sendJson(res, 201, { status: "ok", profile: { user: name, key } });
 };
 
 const handleUpdateKey = async (req, res, params) => {
-  const user = params.user;
-  if (!authConfig.has(user)) {
+  const me = getSessionUser(req);
+  if (!me) return sendJson(res, 401, { status: "error", message: "Требуется авторизация" });
+  const name = params.user;
+  const profile = sql.getProfile.get(name);
+  if (!profile) {
     return sendJson(res, 404, { status: "error", message: "Профиль не найден" });
   }
-  const oldKey = authConfig.get(user);
+  const rights = userCan(me, profile);
+  if (!rights.manage) {
+    return sendJson(res, 403, { status: "error", message: "Недостаточно прав для управления профилем" });
+  }
+  const oldKey = profile.key;
   let body = {};
   try {
     body = JSON.parse((await readBody(req)) || "{}");
@@ -339,28 +445,38 @@ const handleUpdateKey = async (req, res, params) => {
   } else {
     key = generateKey();
   }
-  if (!safeSave(res, getProfiles().map((p) => (p.user === user ? { user, key } : p)))) return;
-  sendJson(res, 200, { status: "ok", profile: { user, key } });
+  sql.updateProfileKey.run(key, name);
+  authConfig.set(name, key);
+  sendJson(res, 200, { status: "ok", profile: { user: name, key } });
   if (oldKey !== key) {
-    disconnectStream(profileStreamid(user, oldKey));
+    disconnectStream(profileStreamid(name, oldKey));
   }
 };
 
 const handleDeleteProfile = async (req, res, params) => {
-  const user = params.user;
-  if (!authConfig.has(user)) {
+  const me = getSessionUser(req);
+  if (!me) return sendJson(res, 401, { status: "error", message: "Требуется авторизация" });
+  const name = params.user;
+  const profile = sql.getProfile.get(name);
+  if (!profile) {
     return sendJson(res, 404, { status: "error", message: "Профиль не найден" });
   }
-  if (await isProfileLive(user)) {
+  const rights = userCan(me, profile);
+  if (!rights.manage) {
+    return sendJson(res, 403, { status: "error", message: "Недостаточно прав для управления профилем" });
+  }
+  if (await isProfileLive(name)) {
     return sendJson(res, 409, {
       status: "error",
       message: "Профиль находится в эфире — удаление невозможно",
     });
   }
-  const key = authConfig.get(user);
-  if (!safeSave(res, getProfiles().filter((p) => p.user !== user))) return;
+  const key = profile.key;
+  sql.deleteProfile.run(name);
+  sql.deletePermsOnProfile.run(name);
+  authConfig.delete(name);
   sendJson(res, 200, { status: "ok" });
-  disconnectStream(profileStreamid(user, key));
+  disconnectStream(profileStreamid(name, key));
 };
 
 const handleKeygen = (req, res) => {
@@ -416,10 +532,10 @@ async function fetchAllPublishers() {
 }
 
 async function isProfileLive(user) {
-  const key = authConfig.get(user);
-  if (!key) return false;
+  const profile = sql.getProfile.get(user);
+  if (!profile) return false;
   const publishers = await fetchAllPublishers();
-  return Object.prototype.hasOwnProperty.call(publishers, profileStreamid(user, key));
+  return Object.prototype.hasOwnProperty.call(publishers, profileStreamid(user, profile.key));
 }
 
 async function disconnectStream(streamid) {
@@ -435,13 +551,172 @@ async function disconnectStream(streamid) {
   }
 }
 
-const handleStatsProxy = async (res) => {
+const handleStatsProxy = async (req, res) => {
+  const user = getSessionUser(req);
+  if (!user) return sendJson(res, 401, { status: "error", message: "Требуется авторизация" });
+  if (!user.can_view_stats) {
+    return sendJson(res, 403, { status: "error", message: "Нет права на просмотр статистики" });
+  }
   try {
     const publishers = await fetchAllPublishers();
+    if (user.role !== "admin") {
+      const visible = new Set(visibleProfiles(user).map((p) => p.user));
+      for (const [streamid] of Object.entries(publishers)) {
+        const m = String(streamid).match(/^live\/stream\/([^?/]+)/);
+        if (!m || !visible.has(m[1])) delete publishers[streamid];
+      }
+    }
     sendJson(res, 200, { status: "ok", publishers });
   } catch {
     sendJson(res, 502, { status: "error", message: "Статистика недоступна" });
   }
+};
+
+// ---- Users admin API --------------------------------------------------------
+
+const handleListUsers = (req, res) => {
+  const rows = sql.listUsers.all().map((u) => ({
+    username: u.username,
+    role: u.role,
+    canViewStats: !!u.can_view_stats,
+    maxProfiles: u.max_profiles,
+    isRoot: !!u.is_root,
+    createdAt: u.created_at,
+    profileCount: sql.countUserProfiles.get(u.username).c,
+  }));
+  sendJson(res, 200, { status: "ok", users: rows });
+};
+
+const handleCreateUser = async (req, res) => {
+  let body = {};
+  try {
+    body = JSON.parse((await readBody(req)) || "{}");
+  } catch {
+    return sendJson(res, 400, { status: "error", message: "Invalid JSON" });
+  }
+  const { username, pass } = body;
+  if (!validateUser(username)) {
+    return sendJson(res, 400, { status: "error", message: "Недопустимое имя пользователя" });
+  }
+  if (typeof pass !== "string" || pass.length < 6) {
+    return sendJson(res, 400, { status: "error", message: "Пароль должен быть не короче 6 символов" });
+  }
+  if (sql.getUserByUsername.get(username)) {
+    return sendJson(res, 409, { status: "error", message: "Пользователь уже существует" });
+  }
+  const role = body.role === "admin" ? "admin" : "user";
+  const canViewStats = body.canViewStats === false ? 0 : 1;
+  const maxProfiles = Number.isInteger(body.maxProfiles) ? body.maxProfiles : role === "admin" ? -1 : 3;
+  try {
+    sql.createUser.run(username, hashPassword(pass), role, canViewStats, maxProfiles);
+  } catch (e) {
+    return sendJson(res, 409, { status: "error", message: "Пользователь уже существует" });
+  }
+  sendJson(res, 201, { status: "ok" });
+};
+
+const handleUpdateUser = async (req, res, params) => {
+  const me = getSessionUser(req);
+  const username = params.user;
+  const row = sql.getUserByUsername.get(username);
+  if (!row) return sendJson(res, 404, { status: "error", message: "Пользователь не найден" });
+  let body = {};
+  try {
+    body = JSON.parse((await readBody(req)) || "{}");
+  } catch {
+    return sendJson(res, 400, { status: "error", message: "Invalid JSON" });
+  }
+  const passHash = body.pass !== undefined && body.pass !== "" ? hashPassword(body.pass) : undefined;
+  if (body.pass !== undefined && body.pass !== "" && (typeof body.pass !== "string" || body.pass.length < 6)) {
+    return sendJson(res, 400, { status: "error", message: "Пароль должен быть не короче 6 символов" });
+  }
+  const isRoot = !!row.is_root;
+  if (isRoot && body.pass !== undefined && me?.username !== username) {
+    return sendJson(res, 403, { status: "error", message: "Пароль первого администратора можно сменить только с его учётной записи" });
+  }
+  if (isRoot && body.role === "user") {
+    return sendJson(res, 400, { status: "error", message: "Нельзя снять роль первого администратора" });
+  }
+  if (body.role === "user" && row.role === "admin" && me?.username === username) {
+    return sendJson(res, 400, { status: "error", message: "Нельзя снять себе роль администратора" });
+  }
+  if (body.role === "user" && row.role === "admin") {
+    const admins = sql.countAdmins.get().c;
+    if (admins <= 1) {
+      return sendJson(res, 400, { status: "error", message: "Нельзя снять роль последнего администратора" });
+    }
+  }
+  const role = body.role !== undefined ? (body.role === "admin" ? "admin" : "user") : undefined;
+  const canViewStats = body.canViewStats !== undefined ? (body.canViewStats === false ? 0 : 1) : undefined;
+  let maxProfiles = body.maxProfiles !== undefined ? body.maxProfiles : undefined;
+  if (maxProfiles !== undefined && !Number.isInteger(maxProfiles)) {
+    return sendJson(res, 400, { status: "error", message: "maxProfiles должен быть целым числом" });
+  }
+  sql.updateUser.run(passHash ?? null, role ?? null, canViewStats ?? null, maxProfiles ?? null, username);
+  sendJson(res, 200, { status: "ok" });
+};
+
+const handleDeleteUser = (req, res, params) => {
+  const me = getSessionUser(req);
+  const username = params.user;
+  const row = sql.getUserByUsername.get(username);
+  if (!row) return sendJson(res, 404, { status: "error", message: "Пользователь не найден" });
+  if (!!row.is_root) {
+    return sendJson(res, 400, { status: "error", message: "Нельзя удалить первого администратора" });
+  }
+  if (me?.username === username) {
+    return sendJson(res, 400, { status: "error", message: "Нельзя удалить самого себя" });
+  }
+  if (row.role === "admin") {
+    const admins = sql.countAdmins.get().c;
+    if (admins <= 1) {
+      return sendJson(res, 400, { status: "error", message: "Нельзя удалить последнего администратора" });
+    }
+  }
+  sql.deleteUser.run(username);
+  sql.listPermsFor.all(username).forEach((p) => sql.deletePerm.run(username, p.profile_user));
+  sendJson(res, 200, { status: "ok" });
+};
+
+// ---- Permissions API (admin) -------------------------------------------------
+
+const handleListPerms = (req, res, params) => {
+  const username = params.user;
+  if (!sql.getUserByUsername.get(username)) {
+    return sendJson(res, 404, { status: "error", message: "Пользователь не найден" });
+  }
+  const perms = sql.listPermsFor.all(username).map((p) => ({
+    profileUser: p.profile_user,
+    canViewKey: !!p.can_view_key,
+    canManage: !!p.can_manage,
+  }));
+  sendJson(res, 200, { status: "ok", perms });
+};
+
+const handleSetPerm = async (req, res, params) => {
+  const { user: username, profile } = params;
+  if (!sql.getUserByUsername.get(username)) {
+    return sendJson(res, 404, { status: "error", message: "Пользователь не найден" });
+  }
+  if (!sql.getProfile.get(profile)) {
+    return sendJson(res, 404, { status: "error", message: "Профиль не найден" });
+  }
+  let body = {};
+  try {
+    body = JSON.parse((await readBody(req)) || "{}");
+  } catch {
+    return sendJson(res, 400, { status: "error", message: "Invalid JSON" });
+  }
+  const canViewKey = body.canViewKey === true ? 1 : 0;
+  const canManage = body.canManage === true ? 1 : 0;
+  sql.upsertPerm.run(username, profile, canViewKey, canManage);
+  sendJson(res, 200, { status: "ok" });
+};
+
+const handleDeletePerm = (req, res, params) => {
+  const { user: username, profile } = params;
+  sql.deletePerm.run(username, profile);
+  sendJson(res, 200, { status: "ok" });
 };
 
 // ---- Static files -----------------------------------------------------------
@@ -481,34 +756,24 @@ function handleStatic(req, res) {
 
 // ---- Router -----------------------------------------------------------------
 
-function requireAuth(req, res) {
-  const session = getSession(req);
-  if (!session) {
-    sendJson(res, 401, { status: "error", message: "Требуется авторизация" });
-    return null;
-  }
-  return session;
-}
-
 const apiHandlers = {
   "POST /api/login": handleLogin,
   "POST /api/logout": handleLogout,
   "GET /api/session": handleSession,
-  "GET /api/profiles": (req, res) => {
-    if (!requireAuth(req, res)) return;
-    handleListProfiles(req, res);
-  },
-  "POST /api/profiles": (req, res) => {
-    if (!requireAuth(req, res)) return;
-    handleCreateProfile(req, res);
-  },
+  "GET /api/profiles": (req, res) => handleListProfiles(req, res),
+  "POST /api/profiles": (req, res) => handleCreateProfile(req, res),
   "POST /api/keygen": (req, res) => {
     if (!requireAuth(req, res)) return;
     handleKeygen(req, res);
   },
-  "GET /api/stats": (req, res) => {
-    if (!requireAuth(req, res)) return;
-    handleStatsProxy(res);
+  "GET /api/stats": (req, res) => handleStatsProxy(req, res),
+  "GET /api/users": (req, res) => {
+    if (!requireAdmin(req, res)) return;
+    handleListUsers(req, res);
+  },
+  "POST /api/users": (req, res) => {
+    if (!requireAdmin(req, res)) return;
+    handleCreateUser(req, res);
   },
 };
 
@@ -524,6 +789,26 @@ const server = http.createServer((req, res) => {
     if (!requireAuth(req, res)) return;
     if (req.method === "PUT") return handleUpdateKey(req, res, { user: profileMatch[1] });
     if (req.method === "DELETE") return handleDeleteProfile(req, res, { user: profileMatch[1] });
+  }
+
+  const userMatch = url.pathname.match(/^\/api\/users\/([^/]+)$/);
+  if (userMatch) {
+    if (!requireAdmin(req, res)) return;
+    if (req.method === "PUT") return handleUpdateUser(req, res, { user: userMatch[1] });
+    if (req.method === "DELETE") return handleDeleteUser(req, res, { user: userMatch[1] });
+  }
+
+  const permsMatch = url.pathname.match(/^\/api\/perms\/([^/]+)\/([^/]+)$/);
+  if (permsMatch) {
+    if (!requireAdmin(req, res)) return;
+    if (req.method === "PUT") return handleSetPerm(req, res, { user: permsMatch[1], profile: permsMatch[2] });
+    if (req.method === "DELETE") return handleDeletePerm(req, res, { user: permsMatch[1], profile: permsMatch[2] });
+  }
+
+  const permListMatch = url.pathname.match(/^\/api\/perms\/([^/]+)$/);
+  if (permListMatch) {
+    if (!requireAdmin(req, res)) return;
+    if (req.method === "GET") return handleListPerms(req, res, { user: permListMatch[1] });
   }
 
   const legacyHandlers = {

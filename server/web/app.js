@@ -8,6 +8,8 @@ const state = {
   stats: null,
   statsError: null,
   lastStreamids: null,
+  me: null,
+  users: [],
 };
 
 let statsTimer = null;
@@ -87,9 +89,17 @@ function showApp(user) {
   $("#login-view").classList.add("hidden");
   $("#app-view").classList.remove("hidden");
   $("#user-label").textContent = user || "";
+  const me = state.me || {};
+  const isAdmin = me.role === "admin";
+  const roleEl = $("#role-label");
+  roleEl.classList.toggle("hidden", false);
+  roleEl.textContent = isAdmin ? "администратор" : "пользователь";
+  roleEl.className = "badge " + (isAdmin ? "online" : "offline");
+  $("#users-btn").classList.toggle("hidden", !isAdmin);
+  $("#stats-section").classList.toggle("hidden", !me.canViewStats);
   loadProfiles();
-  if (!statsTimer) statsTimer = setInterval(fetchStats, 2000);
-  fetchStats();
+  if (me.canViewStats && !statsTimer) statsTimer = setInterval(fetchStats, 2000);
+  if (me.canViewStats) fetchStats();
 }
 
 $("#login-form").addEventListener("submit", async (e) => {
@@ -97,7 +107,7 @@ $("#login-form").addEventListener("submit", async (e) => {
   const errorEl = $("#login-error");
   errorEl.classList.add("hidden");
   try {
-    await api("/api/login", {
+    const data = await api("/api/login", {
       method: "POST",
       body: JSON.stringify({
         user: $("#login-user").value.trim(),
@@ -105,7 +115,9 @@ $("#login-form").addEventListener("submit", async (e) => {
       }),
     });
     $("#login-pass").value = "";
-    showApp($("#login-user").value.trim());
+    const session = await api("/api/session");
+    state.me = session;
+    showApp(session.user || $("#login-user").value.trim());
   } catch (err) {
     errorEl.textContent = err.message;
     errorEl.classList.remove("hidden");
@@ -119,6 +131,8 @@ $("#logout-btn").addEventListener("click", async () => {
   showLogin();
 });
 
+$("#users-btn").addEventListener("click", openUsersModal);
+
 // ---- profiles --------------------------------------------------------------
 
 async function loadProfiles() {
@@ -126,6 +140,7 @@ async function loadProfiles() {
     const data = await api("/api/profiles");
     state.profiles = data.profiles || [];
     state.host = data.host || "";
+    state.me = data.me || state.me;
     renderProfiles();
   } catch (err) {
     if (err.message !== "unauthorized") toast("Ошибка загрузки профилей: " + err.message, true);
@@ -138,6 +153,25 @@ function renderProfiles() {
   $("#profiles-empty").classList.toggle("hidden", state.profiles.length > 0);
   $("#profiles-table").style.display = state.profiles.length ? "" : "none";
 
+  const me = state.me || {};
+  const isAdmin = me.role === "admin";
+  const limitReached = !isAdmin && me.maxProfiles >= 0 && me.createdProfiles >= me.maxProfiles;
+  const addBtn = $("#add-profile-btn");
+  if (limitReached) {
+    addBtn.disabled = true;
+    addBtn.title = "Достигнут лимит профилей";
+  } else {
+    addBtn.disabled = false;
+    addBtn.removeAttribute("title");
+  }
+  const limitEl = $("#profile-limit");
+  if (!isAdmin && me.maxProfiles >= 0) {
+    limitEl.textContent = `(создано ${me.createdProfiles} из ${me.maxProfiles})`;
+    limitEl.classList.remove("hidden");
+  } else {
+    limitEl.classList.add("hidden");
+  }
+
   const online = onlineUsers();
 
   for (const profile of state.profiles) {
@@ -148,28 +182,40 @@ function renderProfiles() {
     userTd.textContent = profile.user;
     tr.appendChild(userTd);
 
+    const ownerTd = document.createElement("td");
+    ownerTd.textContent = profile.createdBy || "—";
+    ownerTd.className = "muted small";
+    tr.appendChild(ownerTd);
+
     const keyTd = document.createElement("td");
     const keyWrap = document.createElement("div");
     keyWrap.className = "key-cell";
-    const keySpan = document.createElement("span");
-    keySpan.className = "key";
-    keySpan.dataset.value = profile.key;
-    keySpan.textContent = profile.key;
-    keyWrap.appendChild(keySpan);
-    const eyeBtn = document.createElement("button");
-    eyeBtn.className = "ghost tiny";
-    eyeBtn.textContent = "👁";
-    eyeBtn.title = "Показать/скрыть";
-    eyeBtn.addEventListener("click", () => {
-      keySpan.textContent = keySpan.textContent === profile.key ? "••••••••••••••••" : profile.key;
-    });
-    keyWrap.appendChild(eyeBtn);
-    const copyKeyBtn = document.createElement("button");
-    copyKeyBtn.className = "ghost tiny";
-    copyKeyBtn.textContent = "⧉";
-    copyKeyBtn.title = "Скопировать ключ";
-    copyKeyBtn.addEventListener("click", () => copyText(profile.key));
-    keyWrap.appendChild(copyKeyBtn);
+    if (profile.canViewKey) {
+      const keySpan = document.createElement("span");
+      keySpan.className = "key";
+      keySpan.dataset.value = profile.key;
+      keySpan.textContent = profile.key;
+      keyWrap.appendChild(keySpan);
+      const eyeBtn = document.createElement("button");
+      eyeBtn.className = "ghost tiny";
+      eyeBtn.textContent = "👁";
+      eyeBtn.title = "Показать/скрыть";
+      eyeBtn.addEventListener("click", () => {
+        keySpan.textContent = keySpan.textContent === profile.key ? "••••••••••••••••" : profile.key;
+      });
+      keyWrap.appendChild(eyeBtn);
+      const copyKeyBtn = document.createElement("button");
+      copyKeyBtn.className = "ghost tiny";
+      copyKeyBtn.textContent = "⧉";
+      copyKeyBtn.title = "Скопировать ключ";
+      copyKeyBtn.addEventListener("click", () => copyText(profile.key));
+      keyWrap.appendChild(copyKeyBtn);
+    } else {
+      const muted = document.createElement("span");
+      muted.className = "muted";
+      muted.textContent = "нет доступа";
+      keyWrap.appendChild(muted);
+    }
     keyTd.appendChild(keyWrap);
     tr.appendChild(keyTd);
 
@@ -182,53 +228,67 @@ function renderProfiles() {
     tr.appendChild(statusTd);
 
     const linksTd = document.createElement("td");
-    const linkRow = document.createElement("div");
-    linkRow.className = "link-row";
-    const select = document.createElement("select");
-    select.className = "url-select";
-    const urlOptions = [
-      { label: "Publish SRT direct (:4001)", value: profile.urls.publishDirect },
-      { label: "Play (:4000)", value: profile.urls.play },
-      { label: "Play legacy (:8282)", value: profile.urls.legacy },
-      { label: "Stats URL (:8181)", value: profile.urls.stats },
-    ];
-    for (const opt of urlOptions) {
-      const o = document.createElement("option");
-      o.value = opt.value;
-      o.textContent = opt.label;
-      select.appendChild(o);
+    if (profile.urls) {
+      const linkRow = document.createElement("div");
+      linkRow.className = "link-row";
+      const select = document.createElement("select");
+      select.className = "url-select";
+      const urlOptions = [
+        { label: "Publish SRT direct (:4001)", value: profile.urls.publishDirect },
+        { label: "Play (:4000)", value: profile.urls.play },
+        { label: "Play legacy (:8282)", value: profile.urls.legacy },
+        { label: "Stats URL (:8181)", value: profile.urls.stats },
+      ];
+      for (const opt of urlOptions) {
+        const o = document.createElement("option");
+        o.value = opt.value;
+        o.textContent = opt.label;
+        select.appendChild(o);
+      }
+      linkRow.appendChild(select);
+      const copyLinkBtn = document.createElement("button");
+      copyLinkBtn.className = "ghost tiny";
+      copyLinkBtn.textContent = "⧉";
+      copyLinkBtn.title = "Скопировать выбранную ссылку";
+      copyLinkBtn.addEventListener("click", () => copyText(select.value));
+      linkRow.appendChild(copyLinkBtn);
+      const belaboxBtn = document.createElement("button");
+      belaboxBtn.className = "ghost tiny";
+      belaboxBtn.textContent = "⚙";
+      belaboxBtn.title = "Настройки Belabox (хост, порт, ключ)";
+      belaboxBtn.addEventListener("click", () => openBelaboxModal(profile));
+      linkRow.appendChild(belaboxBtn);
+      linksTd.appendChild(linkRow);
+    } else {
+      const muted = document.createElement("span");
+      muted.className = "muted";
+      muted.textContent = "нет доступа";
+      linksTd.appendChild(muted);
     }
-    linkRow.appendChild(select);
-    const copyLinkBtn = document.createElement("button");
-    copyLinkBtn.className = "ghost tiny";
-    copyLinkBtn.textContent = "⧉";
-    copyLinkBtn.title = "Скопировать выбранную ссылку";
-    copyLinkBtn.addEventListener("click", () => copyText(select.value));
-    linkRow.appendChild(copyLinkBtn);
-    const belaboxBtn = document.createElement("button");
-    belaboxBtn.className = "ghost tiny";
-    belaboxBtn.textContent = "⚙";
-    belaboxBtn.title = "Настройки Belabox (хост, порт, ключ)";
-    belaboxBtn.addEventListener("click", () => openBelaboxModal(profile));
-    linkRow.appendChild(belaboxBtn);
-    linksTd.appendChild(linkRow);
     tr.appendChild(linksTd);
 
     const actionsTd = document.createElement("td");
-    const actionsRow = document.createElement("div");
-    actionsRow.className = "link-row";
-    const editBtn = document.createElement("button");
-    editBtn.className = "ghost";
-    editBtn.textContent = "Изменить ключ";
-    editBtn.addEventListener("click", () => openEditModal(profile));
-    actionsRow.appendChild(editBtn);
-    const delBtn = document.createElement("button");
-    delBtn.className = "danger del-btn";
-    delBtn.textContent = "Удалить";
-    delBtn.dataset.user = profile.user;
-    delBtn.addEventListener("click", () => openDeleteModal(profile));
-    actionsRow.appendChild(delBtn);
-    actionsTd.appendChild(actionsRow);
+    if (profile.canManage) {
+      const actionsRow = document.createElement("div");
+      actionsRow.className = "link-row";
+      const editBtn = document.createElement("button");
+      editBtn.className = "ghost";
+      editBtn.textContent = "Изменить ключ";
+      editBtn.addEventListener("click", () => openEditModal(profile));
+      actionsRow.appendChild(editBtn);
+      const delBtn = document.createElement("button");
+      delBtn.className = "danger del-btn";
+      delBtn.textContent = "Удалить";
+      delBtn.dataset.user = profile.user;
+      delBtn.addEventListener("click", () => openDeleteModal(profile));
+      actionsRow.appendChild(delBtn);
+      actionsTd.appendChild(actionsRow);
+    } else {
+      const muted = document.createElement("span");
+      muted.className = "muted";
+      muted.textContent = "—";
+      actionsTd.appendChild(muted);
+    }
     tr.appendChild(actionsTd);
 
     body.appendChild(tr);
@@ -246,10 +306,10 @@ function closeModal() {
   $("#modal-backdrop").classList.add("hidden");
 }
 
-function modalFooter(cancelText = "Отмена") {
+function modalFooter(cancelText = "Отмена", submitText = "Сохранить") {
   return `<div class="modal-footer">
     <button class="ghost" data-close>${escapeHtml(cancelText)}</button>
-    <button class="primary" id="modal-submit">Сохранить</button>
+    <button class="primary" id="modal-submit">${escapeHtml(submitText)}</button>
   </div>`;
 }
 
@@ -280,7 +340,7 @@ function openAddModal() {
       <button class="ghost" id="add-gen-btn">Сгенерировать ключ</button>
     </div>
     <div id="modal-error" class="error hidden"></div>
-    ${modalFooter("Отмена")}
+    ${modalFooter("Отмена", "Создать")}
   `);
   $("#add-gen-btn").addEventListener("click", () => generateInto("add-key"));
   wireModal(async () => {
@@ -305,7 +365,7 @@ function openEditModal(profile) {
   openModal(`
     <h2>Изменить ключ — ${escapeHtml(profile.user)}</h2>
     <label>Новый ключ (оставьте пустым — сгенерируется автоматически)
-      <input type="text" id="edit-key" value="${escapeHtml(profile.key)}">
+      <input type="text" id="edit-key" value="${escapeHtml(profile.key || "")}">
     </label>
     <div class="link-row">
       <button class="ghost" id="edit-gen-btn">Сгенерировать ключ</button>
@@ -362,6 +422,272 @@ function showModalError(message) {
 }
 
 $("#add-profile-btn").addEventListener("click", openAddModal);
+
+// ---- users admin (modal) ---------------------------------------------------
+
+async function openUsersModal() {
+  openModal(`<h2>Пользователи</h2><div id="users-content" class="muted">Загрузка…</div>`);
+  await renderUsersList();
+}
+
+async function renderUsersList() {
+  const content = $("#users-content");
+  try {
+    const data = await api("/api/users");
+    state.users = data.users || [];
+    let html = `
+      <div class="toolbar">
+        <button class="primary" id="user-add-btn">+ Создать пользователя</button>
+      </div>
+      <div class="table-scroll">
+      <table class="table">
+        <thead><tr>
+          <th>Логин</th><th>Роль</th><th>Статистика</th><th>Лимит профилей</th><th>Создано</th><th>Действия</th>
+        </tr></thead>
+        <tbody>
+    `;
+    for (const u of state.users) {
+      const role = u.role === "admin" ? "администратор" : "пользователь";
+      const stats = u.canViewStats ? "да" : "нет";
+      const limit = u.maxProfiles < 0 ? "∞" : u.maxProfiles;
+      const isSelf = (state.me || {}).user === u.username;
+      const rootBadge = u.isRoot ? " <span class='badge online'>root</span>" : "";
+      const passBtn = u.isRoot && !isSelf
+        ? `<button class="ghost tiny" disabled title="Пароль меняет только владелец">Пароль</button>`
+        : `<button class="ghost tiny user-pass-btn">Пароль</button>`;
+      const delBtn = u.isRoot
+        ? `<button class="danger tiny" disabled title="Первого администратора нельзя удалить">Удалить</button>`
+        : `<button class="danger tiny user-del-btn">Удалить</button>`;
+      html += `<tr data-username="${escapeHtml(u.username)}">
+        <td>${escapeHtml(u.username)}${rootBadge}</td>
+        <td>${role}</td>
+        <td>${stats}</td>
+        <td>${limit}</td>
+        <td>${u.profileCount}</td>
+        <td>
+          <div class="link-row">
+            <button class="ghost tiny user-edit-btn">Права</button>
+            ${passBtn}
+            ${delBtn}
+          </div>
+        </td>
+      </tr>`;
+    }
+    html += `</tbody></table></div>`;
+    content.innerHTML = html;
+
+    $("#user-add-btn").addEventListener("click", openUserCreateModal);
+    for (const btn of content.querySelectorAll(".user-edit-btn")) {
+      const username = btn.closest("tr").dataset.username;
+      btn.addEventListener("click", () => openUserRightsModal(username));
+    }
+    for (const btn of content.querySelectorAll(".user-pass-btn")) {
+      const username = btn.closest("tr").dataset.username;
+      btn.addEventListener("click", () => openUserPassModal(username));
+    }
+    for (const btn of content.querySelectorAll(".user-del-btn")) {
+      const username = btn.closest("tr").dataset.username;
+      btn.addEventListener("click", () => confirmDeleteUser(username));
+    }
+  } catch (err) {
+    content.textContent = "Ошибка: " + err.message;
+  }
+}
+
+function openUserCreateModal() {
+  openModal(`
+    <h2>Создать пользователя</h2>
+    <label>Логин
+      <input type="text" id="u-name" placeholder="например: streamer1" required>
+    </label>
+    <label>Пароль (минимум 6 символов)
+      <input type="password" id="u-pass" required>
+    </label>
+    <label>Роль
+      <select id="u-role">
+        <option value="user">пользователь</option>
+        <option value="admin">администратор</option>
+      </select>
+    </label>
+    <label class="check">
+      <input type="checkbox" id="u-stats" checked> Просмотр статистики
+    </label>
+    <label>Лимит профилей (−1 = без лимита)
+      <input type="number" id="u-limit" value="3" min="-1" step="1">
+    </label>
+    <div id="modal-error" class="error hidden"></div>
+    ${modalFooter("Отмена", "Создать")}
+  `);
+  wireModal(async () => {
+    const username = $("#u-name").value.trim();
+    const pass = $("#u-pass").value;
+    if (!username) return showModalError("Укажите логин");
+    if (pass.length < 6) return showModalError("Пароль должен быть не короче 6 символов");
+    try {
+      await api("/api/users", {
+        method: "POST",
+        body: JSON.stringify({
+          username,
+          pass,
+          role: $("#u-role").value,
+          canViewStats: $("#u-stats").checked,
+          maxProfiles: Number($("#u-limit").value),
+        }),
+      });
+      closeModal();
+      toast(`Пользователь «${username}» создан`);
+      openUsersModal();
+    } catch (err) {
+      showModalError(err.message);
+    }
+  });
+}
+
+function openUserPassModal(username) {
+  openModal(`
+    <h2>Сменить пароль — ${escapeHtml(username)}</h2>
+    <label>Новый пароль (минимум 6 символов)
+      <input type="password" id="u-pass" required>
+    </label>
+    <div id="modal-error" class="error hidden"></div>
+    ${modalFooter("Отмена", "Сохранить")}
+  `);
+  wireModal(async () => {
+    const pass = $("#u-pass").value;
+    if (pass.length < 6) return showModalError("Пароль должен быть не короче 6 символов");
+    try {
+      await api(`/api/users/${encodeURIComponent(username)}`, {
+        method: "PUT",
+        body: JSON.stringify({ pass }),
+      });
+      closeModal();
+      toast("Пароль изменён");
+      openUsersModal();
+    } catch (err) {
+      showModalError(err.message);
+    }
+  });
+}
+
+async function openUserRightsModal(username) {
+  const me = state.me || {};
+  const isSelf = me.user === username;
+  const u = state.users.find((x) => x.username === username);
+  const isRoot = !!(u && u.isRoot);
+  openModal(`
+    <h2>Права — ${escapeHtml(username)}${isRoot ? " <span class='badge online'>первый админ</span>" : ""}</h2>
+    <div id="rights-content" class="muted">Загрузка…</div>
+  `);
+  try {
+    const [profilesData, perms] = await Promise.all([
+      api("/api/profiles"),
+      api(`/api/perms/${encodeURIComponent(username)}`),
+    ]);
+    const myPerms = new Map(perms.perms.map((p) => [p.profileUser, p]));
+    let rows = [];
+    let html = "";
+    const isAdmin = u ? u.role === "admin" : false;
+    const canViewStats = u ? u.canViewStats : true;
+    const maxProfiles = u ? u.maxProfiles : 3;
+    html += `
+      <div class="rights-account">
+        <label>Роль
+          <select id="u-role">
+            <option value="user" ${!isAdmin ? "selected" : ""}>пользователь</option>
+            <option value="admin" ${isAdmin ? "selected" : ""}>администратор</option>
+          </select>
+        </label>
+        <label class="check">
+          <input type="checkbox" id="u-stats" ${canViewStats ? "checked" : ""}> Просмотр статистики
+        </label>
+        <label>Лимит профилей (−1 = без лимита)
+          <input type="number" id="u-limit" value="${maxProfiles}" min="-1" step="1">
+        </label>
+        <label>Новый пароль (оставьте пустым — без изменений)
+          <input type="password" id="u-pass" ${isRoot && !isSelf ? "disabled placeholder='только владелец'" : ""}>
+        </label>
+        ${isRoot ? "<p class='muted small'>Первый администратор: роль не снимается, удаление запрещено, пароль меняет только владелец учётки.</p>" : ""}
+      </div>
+      <h3 class="rights-sub">Доступ к профилям</h3>
+    `;
+    for (const profile of profilesData.profiles) {
+      const p = myPerms.get(profile.user) || { canViewKey: false, canManage: false };
+      const isOwner = profile.createdBy === username;
+      rows.push({ profile: profile.user, isOwner });
+      html += `
+        <div class="perm-row" data-profile="${escapeHtml(profile.user)}">
+          <span class="perm-name">${escapeHtml(profile.user)}${isOwner ? " <span class='muted small'>(владелец)</span>" : ""}</span>
+          <label class="check"><input type="checkbox" class="perm-view" ${p.canViewKey ? "checked" : ""} ${isOwner ? "disabled" : ""}> просмотр ключа</label>
+          <label class="check"><input type="checkbox" class="perm-manage" ${p.canManage ? "checked" : ""} ${isOwner ? "disabled" : ""}> управление</label>
+        </div>`;
+    }
+    html += `<div id="modal-error" class="error hidden"></div>
+      <div class="modal-footer">
+        <button class="ghost" data-close>Закрыть</button>
+        <button class="primary" id="modal-submit">Сохранить</button>
+      </div>`;
+    $("#rights-content").innerHTML = html;
+    if (isRoot && !isSelf) {
+      $("#u-role").disabled = true;
+    }
+    wireModal(async () => {
+      try {
+        const pass = $("#u-pass").value;
+        if (pass !== "" && pass.length < 6) return showModalError("Пароль должен быть не короче 6 символов");
+        await api(`/api/users/${encodeURIComponent(username)}`, {
+          method: "PUT",
+          body: JSON.stringify({
+            role: $("#u-role").value,
+            canViewStats: $("#u-stats").checked,
+            maxProfiles: Number($("#u-limit").value),
+            pass: pass || undefined,
+          }),
+        });
+        for (const row of rows) {
+          const el = document.querySelector(`.perm-row[data-profile="${CSS.escape(row.profile)}"]`);
+          if (!el || row.isOwner) continue;
+          await api(`/api/perms/${encodeURIComponent(username)}/${encodeURIComponent(row.profile)}`, {
+            method: "PUT",
+            body: JSON.stringify({
+              canViewKey: el.querySelector(".perm-view").checked,
+              canManage: el.querySelector(".perm-manage").checked,
+            }),
+          });
+        }
+        closeModal();
+        toast("Права сохранены");
+        openUsersModal();
+      } catch (err) {
+        showModalError(err.message);
+      }
+    });
+  } catch (err) {
+    $("#rights-content").textContent = "Ошибка: " + err.message;
+  }
+}
+
+function confirmDeleteUser(username) {
+  openModal(`
+    <h2>Удалить пользователя?</h2>
+    <p>Пользователь <b>${escapeHtml(username)}</b> будет удалён.
+    Его права на профили будут отозваны.</p>
+    <div id="modal-error" class="error hidden"></div>
+    <div class="modal-footer">
+      <button class="ghost" data-close>Отмена</button>
+      <button class="danger" id="modal-submit">Удалить</button>
+    </div>
+  `);
+  wireModal(async () => {
+    try {
+      await api(`/api/users/${encodeURIComponent(username)}`, { method: "DELETE" });
+      closeModal();
+      toast("Пользователь удалён");
+      openUsersModal();
+    } catch (err) {
+      showModalError(err.message);
+    }
+  });
+}
 
 // ---- stats ---------------------------------------------------------------
 
@@ -633,6 +959,7 @@ document.addEventListener("keydown", (e) => {
 (async function init() {
   try {
     const data = await api("/api/session");
+    state.me = data;
     showApp(data.user);
   } catch {
     showLogin();
