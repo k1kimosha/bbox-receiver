@@ -197,7 +197,7 @@ function buildUrls(user, key, host) {
     publishSrtla: `srt://${host}:5000?streamid=live/stream/${user}?srtauth=${key}`,
     publishDirect: `srt://${host}:4001?streamid=live/stream/${user}?srtauth=${key}`,
     play: `srt://${host}:4000?streamid=play/stream/${user}?srtauth=${key}`,
-    legacy: `srt://${host}:8282?streamid=live/stream/${user}?srtauth=${key}`,
+    legacy: `srt://${host}:8282?streamid=play/stream/${user}?srtauth=${key}`,
     stats: `http://${host}:8181/stats?publisher=${encodeURIComponent(`live/stream/${user}?srtauth=${key}`)}`,
   };
 }

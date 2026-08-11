@@ -1003,24 +1003,31 @@ static int sls_pes2es(const uint8_t *pes_frame, int pes_len, ts_info *ti, int pi
         ret = sls_parse_spspps(pes, (int)(pes_end - pes), ti);
         if (ti->sps_len > 0 && ti->pps_len > 0 && ti->pat_len > 0 && ti->pmt_len > 0)
         {
-            uint8_t *p = ti->ts_data;
-            int pos = 0;
-            uint8_t tmp;
-
-            // pat, pmt
-            memcpy(p + pos, ti->pat, TS_PACK_LEN);
-            pos += TS_PACK_LEN;
-            memcpy(p + pos, ti->pmt, TS_PACK_LEN);
-            pos += TS_PACK_LEN;
-
-            // sps pps
+            // ts_data (pat/pmt/sps/pps prepended to every subscriber stream) is
+            // built once from the first appearance of SPS/PPS. The streamer is
+            // allowed to refresh SPS/PPS mid-stream, but the on-table one-packet
+            // layout can only hold 184 bytes (SPS+PPS+PES headers); if it does
+            // not fit (e.g. large Belbox SPS/PPS), build fails permanently.
+            // Either way, remember the outcome so the block is not re-run on
+            // every put() — otherwise the SEI scanner (which legitimately calls
+            // sls_parse_ts_info continuously) would spam the error path.
             int len = ti->sps_len + ti->pps_len;
             len = len + 9 + 5; // pes len
             if (len > TS_PACK_LEN - 4)
             {
                 spdlog::error("pid={0:d}, pes size={1:d} is abnormal!!!!\n", pid, len);
+                ti->need_spspps = false;
                 return ret;
             }
+
+            uint8_t *p = ti->ts_data;
+            int pos = 0;
+            uint8_t tmp;
+            // pat, pmt
+            memcpy(p + pos, ti->pat, TS_PACK_LEN);
+            pos += TS_PACK_LEN;
+            memcpy(p + pos, ti->pmt, TS_PACK_LEN);
+            pos += TS_PACK_LEN;
             pos++;
             // pid
             ti->es_pid = pid;
@@ -1062,6 +1069,7 @@ static int sls_pes2es(const uint8_t *pes_frame, int pes_len, ts_info *ti, int pi
             pos += ti->sps_len;
             memcpy(p + pos, ti->pps, ti->pps_len);
             pos += ti->pps_len;
+            ti->need_spspps = false;
         }
     }
     return ret;
